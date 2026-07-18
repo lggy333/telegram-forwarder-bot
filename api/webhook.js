@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // 无论如何，第一时间给 TG 回应 200，保证通道绝对不堵塞
+  // 1. 率先向 TG 回报 200，保证通道 100% 瞬间畅通
   res.status(200).send('OK');
 
   try {
@@ -12,61 +12,17 @@ export default async function handler(req, res) {
     const CHANNEL_ID = process.env.CHANNEL_ID;
     const chatId = channel_post.chat.id;
 
-    // 严格限制频道，防止死循环
+    // 严格限制频道，防止机器人无限复读自嗨
     if (String(chatId) !== String(CHANNEL_ID)) return;
-    
-    // 拦截机器人自己发的签名消息，防止无限复读死循环
     if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
       return;
     }
 
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
-    const mediaGroupId = channel_post.media_group_id;
 
-    // --- 【核心逻辑】如果是多图/多视频相册 ---
-    if (mediaGroupId) {
-      // 🏎️ 动态错位睡眠：ID 越小等得越短，ID 最大（最后一个视频）等得最久
-      // 确保最后一个请求醒来时，前面的视频已经在 TG 服务器里排好队了
-      const suffix = messageId % 10; 
-      const delay = suffix * 350 + 1200; // 阶梯式延迟，给足大视频上传和同步的时间
-      await new Promise(resolve => setTimeout(resolve, delay));
-
-      // 🔍 盲搜区间：因为不知道前面具体有几个视频，我们直接抓取当前 ID 往前的 8 个位置
-      const potentialIds = [];
-      for (let i = -7; i <= 0; i++) {
-        potentialIds.push(messageId + i);
-      }
-
-      // 🛠️ 尝试批量复制这个连续区间
-      const batchCopyResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: CHANNEL_ID,
-          from_chat_id: CHANNEL_ID,
-          message_ids: potentialIds
-        })
-      });
-      
-      const batchCopyResult = await batchCopyResp.json();
-
-      // 🧹 只要这次批量复制成功吐出了聚拢的相册，立刻把整个历史区间原消息连根拔起全部删除！
-      if (batchCopyResult.ok && batchCopyResult.result && batchCopyResult.result.length > 0) {
-        await fetch(`${TELEGRAM_API}/deleteMessages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: CHANNEL_ID,
-            message_ids: potentialIds
-          })
-        });
-      }
-      return;
-    }
-
-    // --- 普通单张图、单条文字或单视频 ---
-    // 普通消息不需要等，直接原子化走完“复制 -> 删除”
+    // 🚀 【核心动作 1】：管它几张图，进一个发一个，用单数版 copyMessage
+    // 这样做能保证 100% 成功率。多图发送时，TG 在接收端会自动把连续进来的媒体合成为相册外观！
     const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -76,20 +32,31 @@ export default async function handler(req, res) {
         message_id: messageId
       })
     });
+    
     const copyResult = await copyResponse.json();
 
+    // 🚀 【核心动作 2】：不管复制成功与否，每个并发进来的大脑都稍微等 2.5 秒
+    // 等所有视频在频道里都上传完毕后，直接暴力清空当前 ID 往前的 10 个 ID 盲区
     if (copyResult.ok) {
-      await fetch(`${TELEGRAM_API}/deleteMessage`, {
+      await new Promise(resolve => setTimeout(resolve, 2500));
+
+      const potentialIds = [];
+      for (let i = -9; i <= 0; i++) {
+        potentialIds.push(messageId + i);
+      }
+
+      // 所有并发实例会同时轰炸 deleteMessages，确保带你名字的原视频直接彻底人间蒸发
+      await fetch(`${TELEGRAM_API}/deleteMessages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: CHANNEL_ID,
-          message_id: messageId
+          message_ids: potentialIds
         })
       });
     }
 
   } catch (error) {
-    console.error('频道内时间差洗稿层发生异常:', error);
+    console.error('频道极致洗稿流运行异常:', error);
   }
 }
