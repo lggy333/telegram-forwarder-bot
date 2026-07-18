@@ -18,11 +18,9 @@ export default async function handler(req, res) {
     const chatIdStr = String(channel_post.chat.id).trim();
     const targetChannelIdStr = String(CHANNEL_ID).trim();
 
-    // 如果频道 ID 不匹配，直接退出
     if (chatIdStr !== targetChannelIdStr) return;
     
-    // 极其严格且精简的防死循环：只有当消息绝对是由本机器人发出时才拦截
-    // 彻底防止因个人账号匿名发帖、带签名发帖被误伤拦截的问题
+    // 防死循环：如果消息绝对是由本机器人发出时才拦截
     if (channel_post.from && String(channel_post.from.id) === String(BOT_TOKEN.split(':')[0])) {
       return;
     }
@@ -65,14 +63,15 @@ export default async function handler(req, res) {
     const listKey = `mg:${mediaGroupId}`;
     const lockKey = `lock:${mediaGroupId}`;
 
-    // 1. 原子化操作：将当前图片/视频的 message_id 推入 Redis（此时计数器一定会增加！）
+    // 1. 将当前图片/视频的 message_id 推入 Redis
     await redisFetch(REDIS_URL, REDIS_TOKEN, ['RPUSH', listKey, String(messageId)]);
     await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', listKey, '10']);
 
-    // 2. 分布式锁竞争：尝试抢占该媒体组的“处理官”名额
+    // 2. 修正后的分布式锁竞争：兼容 Upstash REST 返回 "OK" 或 true 的情况
     const setLock = await redisFetch(REDIS_URL, REDIS_TOKEN, ['SET', lockKey, 'processing', 'EX', '5', 'NX']);
     
-    if (setLock !== 'OK') {
+    // 只有明确拿到结果且结果不为 OK 且不为 true 时，才断定抢锁失败
+    if (!setLock || (setLock !== 'OK' && setLock !== true)) {
       return;
     }
 
