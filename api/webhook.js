@@ -64,14 +64,44 @@ export default async function handler(req, res) {
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
 
-    // --- 核心步骤一：原子化复制 ---
-    const copyUrl = `${TELEGRAM_API}/copyMessage`;
-    const copyBody = {
+    // --- 核心步骤一：判定类型并动态构建请求（去模糊核心） ---
+    let copyUrl = `${TELEGRAM_API}/copyMessage`;
+    let copyBody = {
       chat_id: CHANNEL_ID,
       from_chat_id: CHANNEL_ID,
-      message_id: messageId,
-      has_spoiler: false // 【新增】显式设置为 false，强行解开图片/视频的模糊遮罩
+      message_id: messageId
     };
+
+    // 如果包含视频、图片或动图，放弃 copyMessage，改用专属 send 接口并强行设置 has_spoiler: false
+    if (channel_post.video) {
+      copyUrl = `${TELEGRAM_API}/sendVideo`;
+      copyBody = {
+        chat_id: CHANNEL_ID,
+        video: channel_post.video.file_id,
+        caption: channel_post.caption || '',
+        caption_entities: channel_post.caption_entities, // 保留原文本样式（加粗、链接等）
+        has_spoiler: false
+      };
+    } else if (channel_post.photo) {
+      copyUrl = `${TELEGRAM_API}/sendPhoto`;
+      const photoArray = channel_post.photo;
+      copyBody = {
+        chat_id: CHANNEL_ID,
+        photo: photoArray[photoArray.length - 1].file_id, // 取最高清的版本
+        caption: channel_post.caption || '',
+        caption_entities: channel_post.caption_entities,
+        has_spoiler: false
+      };
+    } else if (channel_post.animation) {
+      copyUrl = `${TELEGRAM_API}/sendAnimation`;
+      copyBody = {
+        chat_id: CHANNEL_ID,
+        animation: channel_post.animation.file_id,
+        caption: channel_post.caption || '',
+        caption_entities: channel_post.caption_entities,
+        has_spoiler: false
+      };
+    }
 
     let copyRes = await telegramFetch(copyUrl, {
       method: 'POST',
@@ -92,26 +122,19 @@ export default async function handler(req, res) {
 
     //【高可用决策点】评估复制结果
     if (!copyRes.ok) {
-      console.error('[复制失败网络/系统级异常]:', copyRes);
-      
-      // 如果是频繁触发限流，或者 Telegram 服务器 5xx / 请求超时
-      // 故意向 Telegram 返回 429 或 500 状态码，Telegram 发现非 200 后会自动延时重新投递该 Webhook，确保消息不漏
+      console.error('[发送/复制失败网络/系统级异常]:', copyRes);
       if (copyRes.isRateLimit) return res.status(429).send('Too Many Requests');
       if (copyRes.isTimeout || copyRes.httpStatus >= 500) return res.status(500).send('Telegram Server Error');
-      
-      // 如果是 400 错误（例如原消息已经被手动删了），重试也无用，直接返回 200 丢弃
       return res.status(200).send('OK');
     }
 
     if (!copyRes.data?.ok) {
-      console.error('[复制失败业务级异常]:', copyRes.data);
-      // 业务逻辑错误（例如 403 无权限），返回 200 终止，避免死循环重试
+      console.error('[发送/复制失败业务级异常]:', copyRes.data);
       if (copyRes.data?.error_code === 400) return res.status(200).send('OK');
       return res.status(500).send('Copy Business Logic Error');
     }
 
     // --- 核心步骤二：严格紧跟删除 ---
-    // 运行到这里，说明复制已经绝对成功。接下来的删除动作必须极其小心，不能因为删除失败而导致整条消息被 Telegram 重投。
     const deleteUrl = `${TELEGRAM_API}/deleteMessage`;
     const deleteBody = {
       chat_id: CHANNEL_ID,
@@ -124,7 +147,6 @@ export default async function handler(req, res) {
       body: JSON.stringify(deleteBody)
     });
 
-    // 如果删除因为偶发网络抖动失败，做最后一次原地的“死等重试”挽救
     if (!deleteRes.ok && (deleteRes.isTimeout || deleteRes.isRateLimit)) {
       console.warn('[删除失败挽救] 网络抖动，1秒后进行最后一次定点删除尝试...');
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -137,10 +159,8 @@ export default async function handler(req, res) {
 
   } catch (error) {
     console.error('[全局未捕获严重异常]:', error);
-    // 全局未知代码崩溃时，保险起见返回 200，防止引起不必要的 Telegram 疯狂重投死循环
     return res.status(200).send('OK');
   }
 
-  // 无论删除最终是否彻底成功，由于【复制已成功】，必须返回 200 结束流程，防止多胞胎重复消息
   return res.status(200).send('OK');
 }
