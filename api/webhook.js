@@ -1,16 +1,11 @@
-// ==========================================
-// Vercel 优化：全局常量常驻内存，规避冷启动重复计算
-// ==========================================
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
+// 支持逗号分隔的多个频道 ID
+const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()) : [];
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const DELETE_URL = `${TELEGRAM_API}/deleteMessage`;
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-/**
- * 针对 Vercel 优化的 Fetch 辅助函数
- * 免费版硬限 10s，单次请求超时控制在 3.5s 内是最安全的
- */
 async function telegramFetch(url, options, timeoutMs = 3500) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -30,7 +25,6 @@ async function telegramFetch(url, options, timeoutMs = 3500) {
     }
 
     if (!response.ok) return { ok: false, httpStatus: response.status };
-
     const data = await response.json();
     return { ok: true, data };
   } catch (err) {
@@ -40,33 +34,33 @@ async function telegramFetch(url, options, timeoutMs = 3500) {
 }
 
 export default async function handler(req, res) {
-  // 最快路径拦截
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const { channel_post } = req.body || {};
   if (!channel_post) return res.status(200).send('OK');
 
-  if (!BOT_TOKEN || !CHANNEL_ID) {
+  if (!BOT_TOKEN || ALLOWED_CHANNELS.length === 0) {
     return res.status(500).send('Configuration Error');
   }
 
-  if (String(channel_post.chat.id) !== CHANNEL_ID) return res.status(200).send('OK');
+  // 【动态识别】获取当前触发 Webhook 的频道 ID
+  const currentChannelId = String(channel_post.chat.id);
+  
+  // 检查该频道是否在允许的白名单内
+  if (!ALLOWED_CHANNELS.includes(currentChannelId)) return res.status(200).send('OK');
   if (channel_post.author_signature === 'Bot' || channel_post.from?.is_bot) {
     return res.status(200).send('OK');
   }
 
   const messageId = channel_post.message_id;
-
-  // 扁平化变量提取，加速 V8 引擎解析
   let method = 'copyMessage';
-  const copyBody = { chat_id: CHANNEL_ID };
+  const copyBody = { chat_id: currentChannelId }; // 动态写入当前频道
 
   const video = channel_post.video;
   const photo = channel_post.photo;
   const animation = channel_post.animation;
   const document = channel_post.document;
 
-  // 深度媒体重映射（洗掉模糊关键逻辑）
   if (video) {
     method = 'sendVideo';
     copyBody.video = video.file_id;
@@ -89,7 +83,7 @@ export default async function handler(req, res) {
       copyBody.document = document.file_id;
     }
   } else {
-    copyBody.from_chat_id = CHANNEL_ID;
+    copyBody.from_chat_id = currentChannelId;
     copyBody.message_id = messageId;
   }
 
@@ -104,16 +98,13 @@ export default async function handler(req, res) {
     body: JSON.stringify(copyBody)
   };
 
-  // 核心步骤一：发送（去模糊）
   let copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, fetchOptions);
 
-  // 429 限流原地小碎步避让（仅当等待时间短时重试，防止 Vercel 超时）
   if (!copyRes.ok && copyRes.isRateLimit && copyRes.retryAfter <= 2) {
     await new Promise(resolve => setTimeout(resolve, copyRes.retryAfter * 1000));
     copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, fetchOptions);
   }
 
-  // 异常高可用决策
   if (!copyRes.ok) {
     if (copyRes.isRateLimit) return res.status(429).send('Too Many Requests');
     if (copyRes.isTimeout || copyRes.httpStatus >= 500) return res.status(500).send('Telegram Error');
@@ -124,19 +115,20 @@ export default async function handler(req, res) {
     return res.status(500).send('Business Error');
   }
 
-  // 核心步骤二：严格紧跟删除（在 Vercel 上必须 await 确保执行）
-  const deleteOptions = {
+  // 严格紧跟删除
+  const deleteRes = await telegramFetch(DELETE_URL, {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: CHANNEL_ID, message_id: messageId })
-  };
+    body: JSON.stringify({ chat_id: currentChannelId, message_id: messageId }) // 动态删除当前频道的旧消息
+  });
 
-  const deleteRes = await telegramFetch(DELETE_URL, deleteOptions);
-
-  // 删除网络抖动挽救（同样受控于 3.5s 超时）
   if (!deleteRes.ok && (deleteRes.isTimeout || deleteRes.isRateLimit)) {
     await new Promise(resolve => setTimeout(resolve, 1000));
-    await telegramFetch(DELETE_URL, deleteOptions);
+    await telegramFetch(DELETE_URL, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chat_id: currentChannelId, message_id: messageId })
+    });
   }
 
   return res.status(200).send('OK');
