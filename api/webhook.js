@@ -1,14 +1,12 @@
 export default async function handler(req, res) {
-  // 1. 第一时间返回 200，防止 Telegram Webhook 堵塞
-  res.status(200).send('OK');
-
   try {
-    if (req.method !== 'POST') return;
+    if (req.method !== 'POST') {
+      return res.status(200).send('Not POST');
+    }
 
     const { channel_post } = req.body || {};
     if (!channel_post) {
-      console.log('🚨 收到未知的请求体，不是合法的 channel_post');
-      return;
+      return res.status(200).send('No channel_post');
     }
 
     // 从 Vercel 环境变量中读取配置
@@ -21,18 +19,17 @@ export default async function handler(req, res) {
     const chatIdStr = String(channel_post.chat.id).trim();
     const targetChannelIdStr = CHANNEL_ID ? String(CHANNEL_ID).trim() : '';
 
-    // 【核心诊断日志】打印出两个 ID 到底是什么，一眼就能看出是否匹配！
     console.log(`🔍 [ID比对检查] 当前收到频道ID: "${chatIdStr}" | 环境变量配置ID: "${targetChannelIdStr}"`);
 
     if (chatIdStr !== targetChannelIdStr) {
       console.log('❌ 匹配失败：当前频道 ID 与环境变量不一致，安全拦截退出。');
-      return;
+      return res.status(200).send('ID mismatch');
     }
     
     // 防死循环
     if (channel_post.from && String(channel_post.from.id) === String(BOT_TOKEN.split(':')[0])) {
       console.log('❌ 拦截：此消息由机器人自身发出，防止死循环。');
-      return;
+      return res.status(200).send('Self message');
     }
 
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -66,7 +63,7 @@ export default async function handler(req, res) {
           })
         });
       }
-      return;
+      return res.status(200).send('Single message processed');
     }
 
     // ========================================================
@@ -84,7 +81,8 @@ export default async function handler(req, res) {
     
     if (!setLock || (setLock !== 'OK' && setLock !== true)) {
       console.log('🔒 抢锁失败，由其他并发实例处理，当前实例退出。');
-      return;
+      // 没抢到锁的实例也要安全返回，它们已经完成了写入任务
+      return res.status(200).send('Sub-instance locked');
     }
 
     console.log('🏆 抢锁成功！作为处理官，等待 1.3 秒聚合图片...');
@@ -93,7 +91,9 @@ export default async function handler(req, res) {
     const allIds = await redisFetch(REDIS_URL, REDIS_TOKEN, ['LRANGE', listKey, '0', '-1']);
     console.log('从 Redis 读取到的所有图片 ID:', allIds);
     
-    if (!allIds || allIds.length === 0) return;
+    if (!allIds || allIds.length === 0) {
+      return res.status(200).send('No IDs found');
+    }
 
     const sortedIds = allIds.map(Number).sort((a, b) => a - b);
 
@@ -123,9 +123,13 @@ export default async function handler(req, res) {
     }
 
     await redisFetch(REDIS_URL, REDIS_TOKEN, ['DEL', listKey, lockKey]);
+    
+    // 所有任务安全结束后，由主处理官发送最后的 200 OK
+    return res.status(200).send('Main instance masterfully processed');
 
   } catch (error) {
     console.error('Webhook Error:', error);
+    return res.status(500).send('Internal Error');
   }
 }
 
