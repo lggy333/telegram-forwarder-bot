@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // 1. 率先向 TG 回报 200，保证所有并发请求全都能顺利进来，绝不漏包
+  // 1. 第一时间返回 200，保证并发请求不堵塞
   res.status(200).send('OK');
 
   try {
@@ -10,14 +10,13 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
+    const ADMIN_ID = process.env.ADMIN_ID; // 你的个人 Telegram ID，用来当作机器人的私聊临时缓冲区
+
     const chatId = channel_post.chat.id;
 
-    // 严格限制频道
+    // 严格限制频道，并且防止机器人自嗨死循环
     if (String(chatId) !== String(CHANNEL_ID)) return;
-    
-    // ✨ 精准死循环拦截：只有当消息“已经是转发状态”且“带有 Bot 签名”时才拦截。
-    // 这确保了你刚上传的原始相册能 100% 触发后续逻辑！
-    if (channel_post.forward_origin && channel_post.author_signature === 'Bot') {
+    if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
       return;
     }
 
@@ -25,48 +24,72 @@ export default async function handler(req, res) {
     const messageId = channel_post.message_id;
     const mediaGroupId = channel_post.media_group_id;
 
-    // --- 情况 A：如果是多图/多视频相册 (存在 media_group_id) ---
+    // --- 情况 A：如果是多图/多视频相册 ---
     if (mediaGroupId) {
-      // 🏎️ 阶梯式睡眠：利用 messageId 尾数错开时间（等 1~2 秒），让所有视频在 TG 服务器排好队
-      const delay = (messageId % 5) * 200 + 1200;
-      await new Promise(resolve => setTimeout(resolve, delay));
-
-      // 🔍 盲抓潜在区间：向前覆盖 8 个 ID，把同组相册的视频全部一网打尽
-      const potentialIds = [];
-      for (let i = -7; i <= 0; i++) {
-        potentialIds.push(messageId + i);
-      }
-
-      // 🚀 核心大招：使用批量转发 API (forwardMessages)。
-      // 只有这个 API 传入数组时，TG 才会 100% 强制把多媒体在前端重新聚合为相册，绝不裂开！
-      const forwardResp = await fetch(`${TELEGRAM_API}/forwardMessages`, {
+      // 🚀 【中转核心步骤 1】：把当前进来的这单张图/单视频，先无痕复制到你和 Bot 的私聊框（缓冲暂存）
+      // 跨聊天框传输，TG 会在私聊框里把它们 100% 自动聚拢回完美的相册，绝不漏发！
+      const toBufferResp = await fetch(`${TELEGRAM_API}/copyMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: CHANNEL_ID,
-          from_chat_id: CHANNEL_ID,
-          message_ids: potentialIds
+          chat_id: ADMIN_ID,         // 缓冲地：你和机器人的私聊对话框
+          from_chat_id: CHANNEL_ID,  // 来源：频道
+          message_id: messageId
         })
       });
-      
-      const forwardResult = await forwardResp.json();
+      const toBufferResult = await toBufferResp.json();
 
-      // 🧹 只要批量转发成功吐出了聚拢的相册，所有并发大脑开始疯狂“盲删”你发出来的原始区间
-      if (forwardResult.ok) {
-        await fetch(`${TELEGRAM_API}/deleteMessages`, {
+      if (toBufferResult.ok) {
+        const bufferedMessageId = toBufferResult.result.message_id;
+
+        // 🏎️ 动态阶梯式睡眠：ID 越大（最后的视频）等得越久，确保私聊里的相册已经全部收齐
+        const delay = (messageId % 5) * 300 + 1500;
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        // 🔍 构建一个私聊缓冲区的消息 ID 潜在区间
+        const bufferPotentialIds = [];
+        for (let i = -7; i <= 0; i++) {
+          bufferPotentialIds.push(bufferedMessageId + i);
+        }
+
+        // 🚀 【中转核心步骤 2】：由“天选之子”（最后一个请求）把私聊里聚拢好的完美相册，批量无痕复制回频道！
+        const backToChannelResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            chat_id: CHANNEL_ID,
-            message_ids: potentialIds
+            chat_id: CHANNEL_ID,            // 终点：回到你的频道
+            from_chat_id: ADMIN_ID,         // 来源：私聊缓冲区
+            message_ids: bufferPotentialIds
           })
         });
+        const backToChannelResult = await backToChannelResp.json();
+
+        // 🧹 【中转核心步骤 3】：如果成功发回了完美的纯净相册，把频道里的原消息和私聊里的缓存全部盲删，人间蒸发！
+        if (backToChannelResult.ok && backToChannelResult.result && backToChannelResult.result.length > 0) {
+          // 盲删频道里你发的原始视频区间
+          const channelPotentialIds = [];
+          for (let i = -7; i <= 0; i++) {
+            channelPotentialIds.push(messageId + i);
+          }
+          await fetch(`${TELEGRAM_API}/deleteMessages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: CHANNEL_ID, message_ids: channelPotentialIds })
+          });
+
+          // 顺便把私聊缓冲区也删干净，不留垃圾
+          await fetch(`${TELEGRAM_API}/deleteMessages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: ADMIN_ID, message_ids: bufferPotentialIds })
+          });
+        }
       }
       return;
     }
 
-    // --- 情况 B：普通单张图、单条文字或单视频 ---
-    // 单条消息不需要复杂的等待，直接走原子化“复制 -> 删除”
+    // --- 情况 B：普通的单文本或单张图 ---
+    // 普通消息没并发压力，直接在频道内原地“复制 -> 删除”即可
     const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -90,6 +113,6 @@ export default async function handler(req, res) {
     }
 
   } catch (error) {
-    console.error('聚合层运行异常:', error);
+    console.error('机器人自主缓冲流异常:', error);
   }
 }
