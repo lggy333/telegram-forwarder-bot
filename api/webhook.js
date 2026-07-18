@@ -8,6 +8,18 @@ export default async function handler(req, res) {
     const { channel_post } = req.body || {};
     if (!channel_post) {
       return res.status(200).send('OK');
+      const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
+
+console.log("================================");
+console.log("INSTANCE:", INSTANCE_ID);
+console.log("TIME:", Date.now());
+
+const { channel_post } = req.body || {};
+
+if (channel_post) {
+  console.log("message_id:", channel_post.message_id);
+  console.log("media_group_id:", channel_post.media_group_id);
+}
     }
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
