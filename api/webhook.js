@@ -1,67 +1,91 @@
 export default async function handler(req, res) {
-  // 核心：不再提前回应 200，让请求在当前实例里死等直到执行完毕
+  // 第一时间返回 200，防止 Telegram Webhook 重试
+  res.status(200).send("OK");
+
   try {
-    if (req.method !== 'POST') {
-      return res.status(405).send('Method Not Allowed');
+    if (req.method !== "POST") return;
+
+    // 每个 Vercel 实例只生成一次 ID
+    if (!global.instanceId) {
+      global.instanceId = Math.random().toString(36).slice(2, 8);
     }
 
     const { channel_post } = req.body || {};
+
+    console.log("====================================");
+    console.log("INSTANCE:", global.instanceId);
+    console.log("PID:", process.pid);
+    console.log("TIME:", new Date().toISOString());
+
     if (!channel_post) {
-      return res.status(200).send('OK');
-      const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
-
-console.log("================================");
-console.log("INSTANCE:", INSTANCE_ID);
-console.log("TIME:", Date.now());
-
-const { channel_post } = req.body || {};
-
-if (channel_post) {
-  console.log("message_id:", channel_post.message_id);
-  console.log("media_group_id:", channel_post.media_group_id);
-}
+      console.log("No channel_post");
+      return;
     }
+
+    console.log("message_id:", channel_post.message_id);
+    console.log("media_group_id:", channel_post.media_group_id || "NONE");
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
+    const chatId = channel_post.chat.id;
 
-    // 严格限制频道与机器人自身，防止死循环
-    if (String(channel_post.chat.id) !== String(CHANNEL_ID)) return res.status(200).send('OK');
-    if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
-      return res.status(200).send('OK');
+    // 只处理目标频道
+    if (String(chatId) !== String(CHANNEL_ID)) {
+      console.log("Skip: other chat");
+      return;
+    }
+
+    // 忽略机器人自己发送的消息
+    if (
+      channel_post.author_signature === "Bot" ||
+      (channel_post.from && channel_post.from.is_bot)
+    ) {
+      console.log("Skip: bot message");
+      return;
     }
 
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
 
-    // 1. 原子化复制：进来一个，立刻复制一个
-    const copyResp = await fetch(`${TELEGRAM_API}/copyMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    console.log("Start copyMessage:", messageId);
+
+    const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         chat_id: CHANNEL_ID,
         from_chat_id: CHANNEL_ID,
-        message_id: messageId
-      })
+        message_id: messageId,
+      }),
     });
-    const copyResult = await copyResp.json();
 
-    // 2. 严格紧跟删除：只有当前这个复制成功了，才立刻定点去删对应的原消息
-    // 绝不在代码里搞批量，防止 Telegram 频繁限制
+    const copyResult = await copyResponse.json();
+
+    console.log("copyMessage result:", copyResult.ok);
+
     if (copyResult.ok) {
-      await fetch(`${TELEGRAM_API}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      console.log("Deleting:", messageId);
+
+      const deleteResponse = await fetch(`${TELEGRAM_API}/deleteMessage`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           chat_id: CHANNEL_ID,
-          message_id: messageId
-        })
+          message_id: messageId,
+        }),
       });
+
+      const deleteResult = await deleteResponse.json();
+
+      console.log("deleteMessage result:", deleteResult.ok);
     }
 
-  } catch (error) {
-    console.error('原子层异常:', error);
+    console.log("Done:", messageId);
+  } catch (err) {
+    console.error("Webhook Error:", err);
   }
-
-  return res.status(200).send('OK');
 }
