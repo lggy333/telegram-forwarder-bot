@@ -1,29 +1,29 @@
 export default async function handler(req, res) {
-  // 1. 率先向 TG 回报 200，保证通道 100% 瞬间畅通
-  res.status(200).send('OK');
-
+  // 核心：不再提前回应 200，让请求在当前实例里死等直到执行完毕
   try {
-    if (req.method !== 'POST') return;
+    if (req.method !== 'POST') {
+      return res.status(405).send('Method Not Allowed');
+    }
 
     const { channel_post } = req.body || {};
-    if (!channel_post) return;
+    if (!channel_post) {
+      return res.status(200).send('OK');
+    }
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
-    const chatId = channel_post.chat.id;
 
-    // 严格限制频道，防止机器人无限复读自嗨
-    if (String(chatId) !== String(CHANNEL_ID)) return;
+    // 严格限制频道与机器人自身，防止死循环
+    if (String(channel_post.chat.id) !== String(CHANNEL_ID)) return res.status(200).send('OK');
     if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
-      return;
+      return res.status(200).send('OK');
     }
 
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
 
-    // 🚀 【核心动作 1】：管它几张图，进一个发一个，用单数版 copyMessage
-    // 这样做能保证 100% 成功率。多图发送时，TG 在接收端会自动把连续进来的媒体合成为相册外观！
-    const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
+    // 1. 原子化复制：进来一个，立刻复制一个
+    const copyResp = await fetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -32,31 +32,24 @@ export default async function handler(req, res) {
         message_id: messageId
       })
     });
-    
-    const copyResult = await copyResponse.json();
+    const copyResult = await copyResp.json();
 
-    // 🚀 【核心动作 2】：不管复制成功与否，每个并发进来的大脑都稍微等 2.5 秒
-    // 等所有视频在频道里都上传完毕后，直接暴力清空当前 ID 往前的 10 个 ID 盲区
+    // 2. 严格紧跟删除：只有当前这个复制成功了，才立刻定点去删对应的原消息
+    // 绝不在代码里搞批量，防止 Telegram 频繁限制
     if (copyResult.ok) {
-      await new Promise(resolve => setTimeout(resolve, 2500));
-
-      const potentialIds = [];
-      for (let i = -9; i <= 0; i++) {
-        potentialIds.push(messageId + i);
-      }
-
-      // 所有并发实例会同时轰炸 deleteMessages，确保带你名字的原视频直接彻底人间蒸发
-      await fetch(`${TELEGRAM_API}/deleteMessages`, {
+      await fetch(`${TELEGRAM_API}/deleteMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: CHANNEL_ID,
-          message_ids: potentialIds
+          message_id: messageId
         })
       });
     }
 
   } catch (error) {
-    console.error('频道极致洗稿流运行异常:', error);
+    console.error('原子层异常:', error);
   }
+
+  return res.status(200).send('OK');
 }
