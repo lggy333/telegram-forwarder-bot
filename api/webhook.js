@@ -70,7 +70,7 @@ export default async function handler(req, res) {
   } else if (animation) {
     method = 'sendAnimation';
     copyBody.animation = animation.file_id;
-  } else if (document) {
+} else if (document) {
     const mime = document.mime_type || '';
     if (mime.startsWith('video/')) {
       method = 'sendVideo';
@@ -82,9 +82,15 @@ export default async function handler(req, res) {
       method = 'sendDocument';
       copyBody.document = document.file_id;
     }
-  } else {
+  } else if (channel_post.audio || channel_post.voice || channel_post.sticker) {
+    // 兼容：如果有音频、语音、贴纸等其他附件，依然走无痕转发
     copyBody.from_chat_id = currentChannelId;
     copyBody.message_id = messageId;
+  } else {
+    // ========== 核心修改 ==========
+    // 如果没有任何附件（如纯文字、带推特链接的纯文字），直接放行退出。
+    // 不复制，不删除，这样另一个 X 下载机器人就能接收并处理这条消息了。
+    return res.status(200).send('OK');
   }
 
   if (method !== 'copyMessage') {
