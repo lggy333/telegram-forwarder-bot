@@ -1,6 +1,5 @@
 export default async function handler(req, res) {
-  // 1. 进来立刻先响应 200，绝不让 Telegram 延迟重发
-  res.status(200).send('OK');
+  res.status(200).send('OK'); // 第一时间响应
 
   try {
     if (req.method !== 'POST') return;
@@ -21,35 +20,61 @@ export default async function handler(req, res) {
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
 
-    // 🚀 【无状态核心逻辑】：
-    // 无论是单图、文字、还是多图相册中的某一张，我们都只把它当成“独立的一条消息”来处理。
-    // 我们用单数版的 copyMessage 把它复制出来。
-    // 对于多图相册，因为并发速度极快，Telegram 收到这几条复制请求后，会自动在频道里把它们组合回相册！
-    const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
+    // 🌟 【核心破局点】：我们不直接 copy 到 CHANNEL_ID，我们用 forwardMessages 先把消息“转发”给机器人自己
+    // 机器人自己（对，就是发给 Bot 的 Token 自身，或者随便一个有效 ID，这里可以用 ADMIN_ID 也就是你自己作为中转站）
+    const ADMIN_ID = process.env.ADMIN_ID;
+
+    // 1. 先把频道的原消息转发给中转站（你自己的私聊）
+    const forwardResp = await fetch(`${TELEGRAM_API}/forwardMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: CHANNEL_ID,
+        chat_id: ADMIN_ID,
         from_chat_id: CHANNEL_ID,
         message_id: messageId
       })
     });
-    
-    const copyResult = await copyResponse.json();
+    const forwardResult = await forwardResp.json();
 
-    // 3. 复制成功后，该请求对应的实例立刻精准删除属于它自己的那张原图，绝不越界
-    if (copyResult.ok) {
-      await fetch(`${TELEGRAM_API}/deleteMessage`, {
+    if (forwardResult.ok) {
+      const tempMessageId = forwardResult.result.message_id;
+
+      // 2. 机器人从中转站把这条消息 copyMessage 回频道（这时来源变成了你和 Bot 的私聊，成功绕过“不能自己复制给自己”的限制！）
+      const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: CHANNEL_ID,
-          message_id: messageId
+          from_chat_id: ADMIN_ID,
+          message_id: tempMessageId
         })
       });
+      const copyResult = await copyResponse.json();
+
+      // 3. 成功发回频道后，把频道里的原消息，以及中转站的临时消息全部斩草除根删掉！
+      if (copyResult.ok) {
+        // 删除频道原消息
+        await fetch(`${TELEGRAM_API}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: CHANNEL_ID,
+            message_id: messageId
+          })
+        });
+        // 删除中转站的临时消息
+        await fetch(`${TELEGRAM_API}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: ADMIN_ID,
+            message_id: tempMessageId
+          })
+        });
+      }
     }
 
   } catch (error) {
-    console.error('运行期发生致命拦截:', error);
+    console.error('频道中转执行出错:', error);
   }
 }
