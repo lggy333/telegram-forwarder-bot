@@ -1,45 +1,94 @@
+// 全局内存缓存，用于合并高并发的多图相册事件
+let mediaGroupCache = {};
+
 export default async function handler(req, res) {
-  // 无论如何，第一时间向 TG 服务器返回 200，确保机器人稳如磐石
   res.status(200).send('OK');
 
   try {
     if (req.method !== 'POST') return;
 
-    // ✨ 频道消息的字段叫 channel_post，而不是普通的 message
     const { channel_post } = req.body || {};
     if (!channel_post) return;
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
-    
-    // 注意：频道里没有 message.from.id，我们直接校验这个频道是不是你的目标归档频道
     const chatId = channel_post.chat.id;
-    
-    if (String(chatId) === String(CHANNEL_ID)) {
-      const messageId = channel_post.message_id;
-      const text = channel_post.text || '';
 
-      // 1. 检查这条消息是不是机器人自己发的，如果是自己发的就别理它，否则会无限死循环
-      if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
-        return;
+    // 严格限制只处理目标频道，且忽略机器人自己发的，防止死循环
+    if (String(chatId) !== String(CHANNEL_ID)) return;
+    if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) return;
+
+    const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+    const messageId = channel_post.message_id;
+    const mediaGroupId = channel_post.media_group_id;
+
+    // --- 情况 A：如果是多图/媒体组 (Album) ---
+    if (mediaGroupId) {
+      if (!mediaGroupCache[mediaGroupId]) {
+        mediaGroupCache[mediaGroupId] = {
+          messageIds: [],
+          timer: null
+        };
       }
 
-      const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+      // 将高并发进来的图片 ID 攒起来
+      mediaGroupCache[mediaGroupId].messageIds.push(messageId);
 
-      // 2. 步骤：先由机器人使用 copyMessage 重新复制一份发到这个频道（此时发送者会变成机器人，洗掉你的名字）
+      // 清除前一个定时器，触发“防抖合并”
+      if (mediaGroupCache[mediaGroupId].timer) {
+        clearTimeout(mediaGroupCache[mediaGroupId].timer);
+      }
+
+      // 等待 800 毫秒，确信这一批相册的图片全部进来了，再统一处理
+      mediaGroupCache[mediaGroupId].timer = setTimeout(async () => {
+        const idsToProcess = [...mediaGroupCache[mediaGroupId].messageIds].sort((a, b) => a - b);
+        delete mediaGroupCache[mediaGroupId]; // 及时释放内存
+
+        try {
+          // 使用复数版 copyMessages，完美保留相册结构，不拆散
+          const batchCopyResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: CHANNEL_ID,
+              from_chat_id: CHANNEL_ID,
+              message_ids: idsToProcess
+            })
+          });
+          const batchCopyResult = await batchCopyResp.json();
+
+          // 批量复制成功后，批量斩草除根删除原相册
+          if (batchCopyResult.ok) {
+            await fetch(`${TELEGRAM_API}/deleteMessages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: CHANNEL_ID,
+                message_ids: idsToProcess
+              })
+            });
+          }
+        } catch (err) {
+          console.error('批量相册处理失败:', err);
+        }
+      }, 800);
+
+      return;
+    }
+
+    // --- 情况 B：如果是普通的单张图或单条文字 ---
+    try {
       const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: CHANNEL_ID,       // 目标：还是这个频道
-          from_chat_id: CHANNEL_ID,  // 来源：也是这个频道
+          chat_id: CHANNEL_ID,
+          from_chat_id: CHANNEL_ID,
           message_id: messageId
         })
       });
-
       const copyResult = await copyResponse.json();
 
-      // 3. 步骤：当机器人复制成功后，瞬间把你刚才发的那条原消息抹除
       if (copyResult.ok) {
         await fetch(`${TELEGRAM_API}/deleteMessage`, {
           method: 'POST',
@@ -50,8 +99,11 @@ export default async function handler(req, res) {
           })
         });
       }
+    } catch (error) {
+      console.error('单条消息处理失败:', error);
     }
+
   } catch (error) {
-    console.error('频道内归档执行出错:', error);
+    console.error('全局捕获异常:', error);
   }
 }
