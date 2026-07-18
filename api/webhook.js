@@ -9,7 +9,6 @@ async function telegramFetch(url, options, timeoutMs = 8000) {
     const response = await fetch(url, { ...options, signal: controller.signal });
     clearTimeout(timeoutId);
 
-    // 针对 Telegram 全局 429 限流做特殊标记
     if (response.status === 429) {
       const errorData = await response.json().catch(() => ({}));
       return { 
@@ -36,7 +35,6 @@ async function telegramFetch(url, options, timeoutMs = 8000) {
 }
 
 export default async function handler(req, res) {
-  // 1. 基础安全过滤
   try {
     if (req.method !== 'POST') {
       return res.status(405).send('Method Not Allowed');
@@ -55,7 +53,6 @@ export default async function handler(req, res) {
       return res.status(500).send('Configuration Error');
     }
 
-    // 严格限制频道与机器人自身，防止死循环
     if (String(channel_post.chat.id) !== String(CHANNEL_ID)) return res.status(200).send('OK');
     if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
       return res.status(200).send('OK');
@@ -64,44 +61,79 @@ export default async function handler(req, res) {
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
 
-    // --- 核心步骤一：判定类型并动态构建请求（去模糊核心） ---
-    let copyUrl = `${TELEGRAM_API}/copyMessage`;
+    // --- 核心步骤一：深度媒体类型重映射（彻底去模糊） ---
+    let method = 'copyMessage';
     let copyBody = {
       chat_id: CHANNEL_ID,
       from_chat_id: CHANNEL_ID,
       message_id: messageId
     };
 
-    // 如果包含视频、图片或动图，放弃 copyMessage，改用专属 send 接口并强行设置 has_spoiler: false
+    const caption = channel_post.caption || '';
+    const caption_entities = channel_post.caption_entities || [];
+
     if (channel_post.video) {
-      copyUrl = `${TELEGRAM_API}/sendVideo`;
+      // 标准视频：切换为发送方法，不给 has_spoiler 赋值，默认不模糊
+      method = 'sendVideo';
       copyBody = {
         chat_id: CHANNEL_ID,
         video: channel_post.video.file_id,
-        caption: channel_post.caption || '',
-        caption_entities: channel_post.caption_entities, // 保留原文本样式（加粗、链接等）
-        has_spoiler: false
+        caption,
+        caption_entities
       };
     } else if (channel_post.photo) {
-      copyUrl = `${TELEGRAM_API}/sendPhoto`;
-      const photoArray = channel_post.photo;
+      // 标准图片
+      method = 'sendPhoto';
       copyBody = {
         chat_id: CHANNEL_ID,
-        photo: photoArray[photoArray.length - 1].file_id, // 取最高清的版本
-        caption: channel_post.caption || '',
-        caption_entities: channel_post.caption_entities,
-        has_spoiler: false
+        photo: channel_post.photo[channel_post.photo.length - 1].file_id,
+        caption,
+        caption_entities
       };
     } else if (channel_post.animation) {
-      copyUrl = `${TELEGRAM_API}/sendAnimation`;
+      // 动图 GIF
+      method = 'sendAnimation';
       copyBody = {
         chat_id: CHANNEL_ID,
         animation: channel_post.animation.file_id,
-        caption: channel_post.caption || '',
-        caption_entities: channel_post.caption_entities,
-        has_spoiler: false
+        caption,
+        caption_entities
       };
+    } else if (channel_post.document) {
+      // 【关键修复点】如果是以文件形式发送的媒体
+      const mime = channel_post.document.mime_type || '';
+      
+      if (mime.startsWith('video/')) {
+        // 如果文件本质是视频，强行转化为标准视频流发送，洗掉模糊状态
+        method = 'sendVideo';
+        copyBody = {
+          chat_id: CHANNEL_ID,
+          video: channel_post.document.file_id,
+          caption,
+          caption_entities
+        };
+      } else if (mime.startsWith('image/')) {
+        // 如果文件本质是图片，强行转化为标准图片发送
+        method = 'sendPhoto';
+        copyBody = {
+          chat_id: CHANNEL_ID,
+          photo: channel_post.document.file_id,
+          caption,
+          caption_entities
+        };
+      } else {
+        // 其他普通文件，改用 sendDocument 重新发送，脱离原消息的 copy 机制
+        method = 'sendDocument';
+        copyBody = {
+          chat_id: CHANNEL_ID,
+          document: channel_post.document.file_id,
+          caption,
+          caption_entities
+        };
+      }
     }
+
+    const copyUrl = `${TELEGRAM_API}/${method}`;
 
     let copyRes = await telegramFetch(copyUrl, {
       method: 'POST',
@@ -109,7 +141,7 @@ export default async function handler(req, res) {
       body: JSON.stringify(copyBody)
     });
 
-    //【高可用优化】如果复制请求被 Telegram 限流 (429)，且等待时间较短(<=3秒)，在当前实例内原地抗住并重试一次
+    //【高可用优化】429 限流原地重试
     if (!copyRes.ok && copyRes.isRateLimit && copyRes.retryAfter <= 3) {
       console.warn(`[限流避让] 触发 429，原地等待 ${copyRes.retryAfter} 秒后重试...`);
       await new Promise(resolve => setTimeout(resolve, copyRes.retryAfter * 1000));
@@ -120,16 +152,15 @@ export default async function handler(req, res) {
       });
     }
 
-    //【高可用决策点】评估复制结果
     if (!copyRes.ok) {
-      console.error('[发送/复制失败网络/系统级异常]:', copyRes);
+      console.error('[发送失败网络/系统级异常]:', copyRes);
       if (copyRes.isRateLimit) return res.status(429).send('Too Many Requests');
       if (copyRes.isTimeout || copyRes.httpStatus >= 500) return res.status(500).send('Telegram Server Error');
       return res.status(200).send('OK');
     }
 
     if (!copyRes.data?.ok) {
-      console.error('[发送/复制失败业务级异常]:', copyRes.data);
+      console.error('[发送失败业务级异常]:', copyRes.data);
       if (copyRes.data?.error_code === 400) return res.status(200).send('OK');
       return res.status(500).send('Copy Business Logic Error');
     }
