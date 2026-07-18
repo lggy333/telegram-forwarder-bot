@@ -62,36 +62,42 @@ export default async function handler(req, res) {
     // 场景 B：媒体组多图相册并发（包含 media_group_id）
     // ========================================================
     const listKey = `mg:${mediaGroupId}`;
-    const lockKey = `lock:${mediaGroupId}`;
+    const countKey = `cnt:${mediaGroupId}`;
 
-    // 1. 将当前图片/视频的 message_id 推入 Redis
+    // 1. 将当前图片的 message_id 存入列表
     await redisFetch(REDIS_URL, REDIS_TOKEN, ['RPUSH', listKey, String(messageId)]);
-    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', listKey, '15']);
+    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', listKey, '20']);
 
-    // 2. 分布式锁竞争
-    const setLock = await redisFetch(REDIS_URL, REDIS_TOKEN, ['SET', lockKey, 'processing', 'EX', '8', 'NX']);
-    
-    if (!setLock || (setLock !== 'OK' && setLock !== true)) {
-      return res.status(200).send('Sub-instance locked');
+    // 2. 核心改变：利用计数器记录当前媒体组收到了几张图
+    const currentCount = await redisFetch(REDIS_URL, REDIS_TOKEN, ['INCR', countKey]);
+    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', countKey, '20']);
+
+    console.log(`📸 图片 [${messageId}] 已入库，当前计数器累计收到图片数: ${currentCount}`);
+
+    // 3. 原地假死 2.2 秒，给后续所有并发的图片实例留出充足的写入时间
+    await new Promise(resolve => setTimeout(resolve, 2200));
+
+    // 4. 等待结束后，再次去 Redis 查询这个相册最终的总图片数
+    const finalCount = await redisFetch(REDIS_URL, REDIS_TOKEN, ['GET', countKey]);
+
+    // 5. 兜底判定：如果最终总数大于我当时写入时的数量，说明我不是最后一张图的实例，直接退出！
+    // 这样可以确保在全球高并发下，只有代表“最后一张图”的那个实例会留下来执行发送，其余全部静默释放
+    if (Number(finalCount) !== Number(currentCount)) {
+      console.log(`🔒 判定：当前实例对应的计数 (${currentCount}) 不是最终总数 (${finalCount})，交由后续实例处理，退出。`);
+      return res.status(200).send('Sub-instance redundant');
     }
 
-    // 3. 强力防抖：将等待时间延长至 2.0 秒，确保极端网络下所有图片的 ID 均已成功入库
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // 4. 从 Redis 中撈出所有被聚合的 message_id
+    // 6. 留下的唯一“天选实例”开始收割，捞出 Redis 里攒下的所有 ID
     const allIds = await redisFetch(REDIS_URL, REDIS_TOKEN, ['LRANGE', listKey, '0', '-1']);
-    
     if (!allIds || allIds.length === 0) {
       return res.status(200).send('No IDs found');
     }
 
-    // 严格按 ID 升序排序，保证相册顺序不颠倒
+    // 去重并严格升序排序
     const sortedIds = [...new Set(allIds.map(Number))].sort((a, b) => a - b);
+    console.log('🏆 成功集结全部图片，开始聚合无痕复制，ID 队列:', sortedIds);
 
-    console.log('🚀 准备聚合复制的 ID 队列:', sortedIds);
-
-    // 5. 换回 copyMessages（复数复制版）以彻底去掉“转发来源”标签
-    // 关键：传入 remove_caption: false 保持你原本写好的图注不丢失
+    // 7. 调用 copyMessages 实现无痕复制（无来源标签，保持Caption）
     const copyGroupResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -103,9 +109,9 @@ export default async function handler(req, res) {
       })
     });
     const copyGroupResult = await copyGroupResp.json();
-    console.log('Telegram 聚合复制结果:', copyGroupResult);
+    console.log('Telegram 聚合复制响应结果:', copyGroupResult);
 
-    // 6. 复制成功后批量干净抹除原媒体组
+    // 8. 成功后批量抹除原图
     if (copyGroupResult.ok) {
       await fetch(`${TELEGRAM_API}/deleteMessages`, {
         method: 'POST',
@@ -117,10 +123,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // 7. 清理缓存
-    await redisFetch(REDIS_URL, REDIS_TOKEN, ['DEL', listKey, lockKey]);
-    
-    return res.status(200).send('Main instance masterfully processed');
+    // 9. 善后清理
+    await redisFetch(REDIS_URL, REDIS_TOKEN, ['DEL', listKey, countKey]);
+    return res.status(200).send('Main bundle masterfully executed');
 
   } catch (error) {
     console.error('Webhook Error:', error);
