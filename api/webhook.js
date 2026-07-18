@@ -1,135 +1,75 @@
 export default async function handler(req, res) {
   try {
-    if (req.method !== 'POST') {
-      return res.status(200).send('Not POST');
-    }
+    if (req.method !== 'POST') return res.status(200).send('Not POST');
 
     const { channel_post } = req.body || {};
-    if (!channel_post) {
-      return res.status(200).send('No channel_post');
-    }
+    if (!channel_post) return res.status(200).send('No content');
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
     const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;     
     const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN; 
 
-    const chatIdStr = String(channel_post.chat.id).trim();
-    const targetChannelIdStr = CHANNEL_ID ? String(CHANNEL_ID).trim() : '';
-
-    if (chatIdStr !== targetChannelIdStr) {
-      return res.status(200).send('ID mismatch');
-    }
+    // 严谨校验
+    if (String(channel_post.chat.id).trim() !== String(CHANNEL_ID).trim()) return res.status(200).send('ID mismatch');
     
-    // 防死循环
-    if (channel_post.from && String(channel_post.from.id) === String(BOT_TOKEN.split(':')[0])) {
-      return res.status(200).send('Self message');
-    }
-
+    // 基础过滤
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
-    const mediaGroupId = channel_post.media_group_id;
+    
+    // 强制聚合核心逻辑：使用当前时间的前 3 秒作为 key，不管 ID 是什么，同一瞬间的全部强行聚在一起
+    const timeWindow = Math.floor(Date.now() / 3000);
+    const listKey = `win:${timeWindow}`;
 
-    // ========================================================
-    // 场景 A：单图 或 纯文字 消息（没有 media_group_id）
-    // ========================================================
-    if (!mediaGroupId) {
-      const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: targetChannelIdStr,
-          from_chat_id: targetChannelIdStr,
-          message_id: messageId
-        })
-      });
-      const copyResult = await copyResponse.json();
-
-      if (copyResult.ok) {
-        await fetch(`${TELEGRAM_API}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: targetChannelIdStr,
-            message_id: messageId
-          })
-        });
-      }
-      return res.status(200).send('Single message processed');
-    }
-
-    // ========================================================
-    // 场景 B：媒体组多图相册并发（包含 media_group_id）
-    // ========================================================
-    const listKey = `mg:${mediaGroupId}`;
-    const countKey = `cnt:${mediaGroupId}`;
-
-    // 1. 将当前图片的 message_id 存入列表
+    // 1. 入库
     await redisFetch(REDIS_URL, REDIS_TOKEN, ['RPUSH', listKey, String(messageId)]);
-    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', listKey, '20']);
+    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', listKey, '10']);
 
-    // 2. 核心改变：利用计数器记录当前媒体组收到了几张图
-    const currentCount = await redisFetch(REDIS_URL, REDIS_TOKEN, ['INCR', countKey]);
-    await redisFetch(REDIS_URL, REDIS_TOKEN, ['EXPIRE', countKey, '20']);
+    // 2. 原地等待 2.5 秒，让所有并发的图片全部落入这个时间窗口
+    await new Promise(resolve => setTimeout(resolve, 2500));
 
-    console.log(`📸 图片 [${messageId}] 已入库，当前计数器累计收到图片数: ${currentCount}`);
-
-    // 3. 原地假死 2.2 秒，给后续所有并发的图片实例留出充足的写入时间
-    await new Promise(resolve => setTimeout(resolve, 2200));
-
-    // 4. 等待结束后，再次去 Redis 查询这个相册最终的总图片数
-    const finalCount = await redisFetch(REDIS_URL, REDIS_TOKEN, ['GET', countKey]);
-
-    // 5. 兜底判定：如果最终总数大于我当时写入时的数量，说明我不是最后一张图的实例，直接退出！
-    // 这样可以确保在全球高并发下，只有代表“最后一张图”的那个实例会留下来执行发送，其余全部静默释放
-    if (Number(finalCount) !== Number(currentCount)) {
-      console.log(`🔒 判定：当前实例对应的计数 (${currentCount}) 不是最终总数 (${finalCount})，交由后续实例处理，退出。`);
-      return res.status(200).send('Sub-instance redundant');
-    }
-
-    // 6. 留下的唯一“天选实例”开始收割，捞出 Redis 里攒下的所有 ID
+    // 3. 只有当此时读取到的数据量 >= 之前统计的数据量时才处理（防重复触发）
     const allIds = await redisFetch(REDIS_URL, REDIS_TOKEN, ['LRANGE', listKey, '0', '-1']);
-    if (!allIds || allIds.length === 0) {
-      return res.status(200).send('No IDs found');
+    const uniqueIds = [...new Set(allIds.map(Number))].sort((a, b) => a - b);
+    
+    // 4. 关键：只让“处理过一次”的标记位来决定执行权
+    const lockKey = `lock:${timeWindow}`;
+    const setLock = await redisFetch(REDIS_URL, REDIS_TOKEN, ['SET', lockKey, '1', 'EX', '10', 'NX']);
+    
+    if (!setLock || (setLock !== 'OK' && setLock !== true)) {
+      return res.status(200).send('Waiting for master');
     }
 
-    // 去重并严格升序排序
-    const sortedIds = [...new Set(allIds.map(Number))].sort((a, b) => a - b);
-    console.log('🏆 成功集结全部图片，开始聚合无痕复制，ID 队列:', sortedIds);
+    console.log('🏆 聚合处理队列:', uniqueIds);
 
-    // 7. 调用 copyMessages 实现无痕复制（无来源标签，保持Caption）
+    // 5. 聚合复制
     const copyGroupResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: targetChannelIdStr,
-        from_chat_id: targetChannelIdStr,
-        message_ids: sortedIds,
+        chat_id: CHANNEL_ID,
+        from_chat_id: CHANNEL_ID,
+        message_ids: uniqueIds,
         remove_caption: false
       })
     });
-    const copyGroupResult = await copyGroupResp.json();
-    console.log('Telegram 聚合复制响应结果:', copyGroupResult);
+    const result = await copyGroupResp.json();
 
-    // 8. 成功后批量抹除原图
-    if (copyGroupResult.ok) {
+    if (result.ok) {
       await fetch(`${TELEGRAM_API}/deleteMessages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: targetChannelIdStr,
-          message_ids: sortedIds
+          chat_id: CHANNEL_ID,
+          message_ids: uniqueIds
         })
       });
     }
 
-    // 9. 善后清理
-    await redisFetch(REDIS_URL, REDIS_TOKEN, ['DEL', listKey, countKey]);
-    return res.status(200).send('Main bundle masterfully executed');
+    return res.status(200).send('Bundle success');
 
   } catch (error) {
-    console.error('Webhook Error:', error);
-    return res.status(500).send('Internal Error');
+    return res.status(500).send('Err');
   }
 }
 
@@ -142,8 +82,5 @@ async function redisFetch(url, token, command) {
     });
     const data = await res.json();
     return data.result;
-  } catch (e) {
-    console.error('Redis Error:', e);
-    return null;
-  }
+  } catch (e) { return null; }
 }
