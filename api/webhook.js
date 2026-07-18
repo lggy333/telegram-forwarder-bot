@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // 1. 第一时间向 TG 回报 200，保证实例绝对不被卡死
+  // 1. 无论如何，第一时间给 TG 回应 200，保证通道绝对畅通
   res.status(200).send('OK');
 
   try {
@@ -15,86 +15,30 @@ export default async function handler(req, res) {
     // 严格限制频道，防止死循环
     if (String(chatId) !== String(CHANNEL_ID)) return;
     
-    // ✨ 极度精准的死循环拦截：只拦截带有 Bot 签名的纯净转发消息，绝对不误伤原始上传
-    if (channel_post.author_signature === 'Bot') return;
-
-    const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-    const messageId = channel_post.message_id;
-    const mediaGroupId = channel_post.media_group_id;
-
-    // --- 情况 A：如果是多图/多视频相册 (存在 media_group_id) ---
-    if (mediaGroupId) {
-      // 故意让并发请求根据 messageId 错开一点点时间，让 Telegram 把视频都收齐
-      const delay = (messageId % 5) * 300;
-      await new Promise(resolve => setTimeout(resolve, delay + 600));
-
-      // 盲猜构建一个包含前后可能所有视频的 ID 潜在区间（上下包容 6 条，足够覆盖 4-6 个视频）
-      const potentialIds = [];
-      for (let i = -6; i <= 6; i++) {
-        potentialIds.push(messageId + i);
-      }
-
-      // 提取当前进来的这个媒体的底层类型和文件 ID
-      let type = 'photo';
-      let mediaId = '';
-      
-      if (channel_post.video) {
-        type = 'video';
-        mediaId = channel_post.video.file_id;
-      } else if (channel_post.photo) {
-        type = 'photo';
-        mediaId = channel_post.photo[channel_post.photo.length - 1].file_id;
-      } else if (channel_post.document) {
-        type = 'document';
-        mediaId = channel_post.document.file_id;
-      }
-
-      if (!mediaId) return;
-
-      // 核心魔术：只让当前这批高并发里 ID 最大的那个最终请求去触发发送，防止重复轰炸
-      if (messageId % 2 === 0 || messageId % 3 === 0 || true) {
-        // 直接使用 copyMessages 批量无痕复制整个潜在数字区间！
-        // 这是 Telegram 官方最高效的相册复制器，不会带任何转发小尾巴，保持 100% 纯净
-        const batchCopyResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: CHANNEL_ID,
-            from_chat_id: CHANNEL_ID,
-            message_ids: potentialIds
-          })
-        });
-        const batchCopyResult = await batchCopyResp.json();
-
-        // 只要批量复制成功了，所有并发请求开始同时疯狂“盲删”整个潜在区间
-        // 确保你的原始发送信息（带名字的那些）被彻底消灭
-        if (batchCopyResult.ok) {
-          await fetch(`${TELEGRAM_API}/deleteMessages`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: CHANNEL_ID,
-              message_ids: potentialIds
-            })
-          });
-        }
-      }
+    // 拦截机器人自己发的消息（通过签名判断），防止无限复读死循环
+    if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
       return;
     }
 
-    // --- 情况 B：普通单张图、单视频或单条文字 ---
-    const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
+    const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+    const messageId = channel_post.message_id;
+
+    // 🚀 【核心大招】：无论是单文本、单视频，还是多图相册，一律使用官方最高效的批量无痕复制 API！
+    // 哪怕数组里只有当前这一条 ID，TG 也会自动识别并保持其多媒体相册的聚合结构！
+    const batchCopyResp = await fetch(`${TELEGRAM_API}/copyMessages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: CHANNEL_ID,
         from_chat_id: CHANNEL_ID,
-        message_id: messageId
+        message_ids: [messageId] // 把单条 ID 包装成数组传入
       })
     });
-    const copyResult = await copyResponse.json();
+    
+    const batchCopyResult = await batchCopyResp.json();
 
-    if (copyResult.ok) {
+    // 2. 只要复制成功了，立刻定点清除你发出来的这一个原始消息
+    if (batchCopyResult.ok) {
       await fetch(`${TELEGRAM_API}/deleteMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -106,6 +50,7 @@ export default async function handler(req, res) {
     }
 
   } catch (error) {
-    // 允许静默失败，绝不卡死
+    // 如果万一报错，直接打印在 Vercel 日志里，但绝不卡死程序
+    console.error('Telegram Webhook 运行期发生异常:', error);
   }
 }
