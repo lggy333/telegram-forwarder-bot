@@ -1,114 +1,83 @@
-// 全局缓存，用于在 Vercel 实例存活时辅助合并
-let lastMediaGroupId = null;
-let pendingMessages = [];
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
 export default async function handler(req, res) {
+  // ⚡ 进来立刻先响应 200，绝不让 Vercel 实例有任何机会超时或者被 Telegram 判定死机
+  res.status(200).send('OK');
+
   try {
-    if (req.method !== 'POST') {
-      return res.status(405).send('Method Not Allowed');
-    }
+    if (req.method !== 'POST') return;
 
     const { channel_post } = req.body || {};
-    if (!channel_post) {
-      return res.status(200).send('OK');
-    }
+    if (!channel_post) return;
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
+    const ADMIN_ID = process.env.ADMIN_ID; // 你的个人 TG ID
     const chatId = channel_post.chat.id;
 
     // 严格限制频道 ID，并防止机器人自身死循环
-    if (String(chatId) !== String(CHANNEL_ID)) return res.status(200).send('OK');
+    if (String(chatId) !== String(CHANNEL_ID)) return;
     if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
-      return res.status(200).send('OK');
+      return;
     }
 
     const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
     const messageId = channel_post.message_id;
-    const mediaGroupId = channel_post.media_group_id;
 
-    // ====================================================
-    // --- 情况 A：如果是多图/相册 (存在 media_group_id) ---
-    // ====================================================
-    if (mediaGroupId) {
-      if (lastMediaGroupId !== mediaGroupId) {
-        lastMediaGroupId = mediaGroupId;
-        pendingMessages = [];
-      }
-
-      pendingMessages.push(messageId);
-
-      // 卡住当前请求 1.2 秒，给足并发请求把图片 ID 攒齐的时间
-      await sleep(1200);
-
-      const currentIds = [...new Set(pendingMessages)].sort((a, b) => a - b);
-      
-      // 只有最新到位的那个并发请求，才有资格执行批量转发与删除
-      if (messageId === currentIds[currentIds.length - 1]) {
-        
-        // ✨ 核心修正：使用 forwardMessages 代替 copyMessages，允许同一个频道自转
-        const batchForwardResp = await fetch(`${TELEGRAM_API}/forwardMessages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: CHANNEL_ID,
-            from_chat_id: CHANNEL_ID,
-            message_ids: currentIds
-          })
-        });
-        const batchForwardResult = await batchForwardResp.json();
-
-        // 转发成功后，立刻斩草除根批量删除原消息
-        if (batchForwardResult.ok) {
-          await fetch(`${TELEGRAM_API}/deleteMessages`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: CHANNEL_ID,
-              message_ids: currentIds
-            })
-          });
-        }
-        
-        // 功成身退，清空标记
-        lastMediaGroupId = null;
-        pendingMessages = [];
-      }
-
-      return res.status(200).send('OK');
-    }
-
-    // ====================================================
-    // --- 情况 B：普通单张图或单条文字 ---
-    // ====================================================
-    // ✨ 同样，单条也使用 forwardMessage 自转
-    const forwardResponse = await fetch(`${TELEGRAM_API}/forwardMessage`, {
+    // 🚀【无状态并发核心逻辑】
+    // 无论是单图、文字、还是多图相册里的某一张，每一个并发请求进来，各自只对自己负责：
+    
+    // 步骤 1：先无痕复制到你本人的私聊中（由于是发给个人，TG 100% 允许，且会完美剥离所有转发来源和署名）
+    const copyToAdminResp = await fetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: CHANNEL_ID,
+        chat_id: ADMIN_ID,
         from_chat_id: CHANNEL_ID,
         message_id: messageId
       })
     });
-    const forwardResult = await forwardResponse.json();
+    const copyToAdminResult = await copyToAdminResp.json();
 
-    if (forwardResult.ok) {
-      await fetch(`${TELEGRAM_API}/deleteMessage`, {
+    if (copyToAdminResult.ok) {
+      const tempMessageId = copyToAdminResult.result.message_id;
+
+      // 步骤 2：机器人立刻把你私聊里刚生成的干净消息，再次 copyMessage 拷回频道！
+      // 此时消息的来源变成了“你与机器人的私聊”，完美绕过了“不能自己复制给自己”的底层限制！
+      const copyBackToChannelResp = await fetch(`${TELEGRAM_API}/copyMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: CHANNEL_ID,
-          message_id: messageId
+          from_chat_id: ADMIN_ID,
+          message_id: tempMessageId
         })
       });
+      const copyBackResult = await copyBackToChannelResp.json();
+
+      // 步骤 3：只要拷回去了，立刻把频道里的原消息、以及你私聊里的中转消息全部抹除，不留任何痕迹！
+      if (copyBackResult.ok) {
+        // 强行删除频道里带有你名字/眼睛的原消息
+        await fetch(`${TELEGRAM_API}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: CHANNEL_ID,
+            message_id: messageId
+          })
+        });
+
+        // 强行清理你私聊里的临时缓存消息，保持私聊干净
+        await fetch(`${TELEGRAM_API}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: ADMIN_ID,
+            message_id: tempMessageId
+          })
+        });
+      }
     }
 
   } catch (error) {
-    console.error('运行期发生拦截:', error);
+    console.error('运行期致命拦截:', error);
   }
-
-  return res.status(200).send('OK');
 }
