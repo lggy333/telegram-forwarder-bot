@@ -1,66 +1,57 @@
 export default async function handler(req, res) {
-  // ⚡ 无论发生什么，第一步先跟 Telegram 服务器打招呼，保证接口绝对不挂掉
+  // 无论如何，第一时间向 TG 服务器返回 200，确保机器人稳如磐石
   res.status(200).send('OK');
 
   try {
     if (req.method !== 'POST') return;
 
-    const { message } = req.body || {};
-    if (!message) return;
+    // ✨ 频道消息的字段叫 channel_post，而不是普通的 message
+    const { channel_post } = req.body || {};
+    if (!channel_post) return;
 
     const BOT_TOKEN = process.env.BOT_TOKEN;
     const CHANNEL_ID = process.env.CHANNEL_ID;
-    const ADMIN_ID = Number(process.env.ADMIN_ID);
+    
+    // 注意：频道里没有 message.from.id，我们直接校验这个频道是不是你的目标归档频道
+    const chatId = channel_post.chat.id;
+    
+    if (String(chatId) === String(CHANNEL_ID)) {
+      const messageId = channel_post.message_id;
+      const text = channel_post.text || '';
 
-    const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-
-    // 严格鉴权：只有你本人发的消息才处理
-    if (message.from && message.from.id === ADMIN_ID) {
-      const chatId = message.chat.id;
-      const messageId = message.message_id;
-      const text = message.text || '';
-
-      // 智能放过 /start 指令
-      if (text === '/start') {
-        await fetch(`${TELEGRAM_API}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: '🚀 嗨！无痕归档机器人已全线通电。现在发给我的任何内容，都会瞬间无痕同步到你的私有频道中！'
-          })
-        });
+      // 1. 检查这条消息是不是机器人自己发的，如果是自己发的就别理它，否则会无限死循环
+      if (channel_post.author_signature === 'Bot' || (channel_post.from && channel_post.from.is_bot)) {
         return;
       }
 
-      // 执行转发和删除逻辑
-      // 步骤 1：无痕复制到你的归档频道（不带转发小尾巴）
+      const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
+      // 2. 步骤：先由机器人使用 copyMessage 重新复制一份发到这个频道（此时发送者会变成机器人，洗掉你的名字）
       const copyResponse = await fetch(`${TELEGRAM_API}/copyMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: CHANNEL_ID,
-          from_chat_id: chatId,
+          chat_id: CHANNEL_ID,       // 目标：还是这个频道
+          from_chat_id: CHANNEL_ID,  // 来源：也是这个频道
           message_id: messageId
         })
       });
-      
+
       const copyResult = await copyResponse.json();
 
-      // 步骤 2：当确认频道成功收到后，瞬间抹除你和 Bot 聊天框里的这条原消息
+      // 3. 步骤：当机器人复制成功后，瞬间把你刚才发的那条原消息抹除
       if (copyResult.ok) {
         await fetch(`${TELEGRAM_API}/deleteMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            chat_id: chatId,
+            chat_id: CHANNEL_ID,
             message_id: messageId
           })
         });
       }
     }
   } catch (error) {
-    // 即使代码内部报错，也只在 Vercel 后台打印，绝不把整个机器人搞崩溃
-    console.error('Webhook internal execution error:', error);
+    console.error('频道内归档执行出错:', error);
   }
 }
