@@ -69,7 +69,8 @@ export default async function handler(req, res) {
     const copyBody = {
       chat_id: CHANNEL_ID,
       from_chat_id: CHANNEL_ID,
-      message_id: messageId
+      message_id: messageId,
+      has_spoiler: false // 【新增】显式设置为 false，强行解开图片/视频的模糊遮罩
     };
 
     let copyRes = await telegramFetch(copyUrl, {
