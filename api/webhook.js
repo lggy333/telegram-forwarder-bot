@@ -1,4 +1,4 @@
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_TOKEN = process.env.BOT_TOKEN; 
 const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
 const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()).filter(Boolean) : [];
 const ADMIN_USER_ID = process.env.ALLOWED_USER_ID || process.env.ADMIN_USER_ID;
@@ -8,8 +8,8 @@ const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-// 超时控制 fetch (2500ms)
-async function telegramFetch(url, options, timeoutMs = 2500) {
+// 超时控制 fetch（调整为 7000ms，提高 Vercel 环境稳定性）
+async function telegramFetch(url, options, timeoutMs = 7000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
@@ -29,7 +29,7 @@ async function telegramFetch(url, options, timeoutMs = 2500) {
 }
 
 // ---------------------------------------------------------
-// Redis 操作封装 (支持开关配置持久化)
+// Redis 操作封装 (支持开关配置持久化) - 保持不变
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -46,7 +46,6 @@ async function redisCmd(command, ...args) {
   }
 }
 
-// 获取/切换机器人开关状态
 async function getBotSettings() {
   const dedupRes = await redisCmd('get', 'config:dedup_enabled');
   const backupRes = await redisCmd('get', 'config:backup_enabled');
@@ -56,7 +55,6 @@ async function getBotSettings() {
   };
 }
 
-// 动态获取所有频道的名称与信息
 async function getChannelsInfo() {
   const list = [];
   for (const id of ALLOWED_CHANNELS) {
@@ -74,7 +72,6 @@ async function getChannelsInfo() {
   return list;
 }
 
-// 清空指定频道的 Key
 async function clearChannelKeys(channelId) {
   const pattern = channelId ? `file:${channelId}:*` : `file:*`;
   const keysRes = await redisCmd('keys', pattern);
@@ -97,7 +94,6 @@ async function clearChannelKeys(channelId) {
   }
 }
 
-// 获取某个频道的记录数量
 async function getChannelKeyCount(channelId) {
   const pattern = channelId ? `file:${channelId}:*` : `file:*`;
   const keysRes = await redisCmd('keys', pattern);
@@ -105,7 +101,7 @@ async function getChannelKeyCount(channelId) {
 }
 
 // ---------------------------------------------------------
-// UI 菜单构造器（全点击操作）
+// UI 菜单构造器 - 保持不变
 // ---------------------------------------------------------
 async function buildMainMenu() {
   const settings = await getBotSettings();
@@ -137,7 +133,7 @@ export default async function handler(req, res) {
   const body = req.body || {};
 
   // =========================================================
-  // 处理 1：点击交互按钮 (Callback Query)
+  // 处理 1：点击交互按钮 (Callback Query) - 保持不变
   // =========================================================
   if (body.callback_query) {
     const cb = body.callback_query;
@@ -157,7 +153,6 @@ export default async function handler(req, res) {
 
     const action = cb.data;
 
-    // 1.1 返回主菜单
     if (action === 'menu_main') {
       const menu = await buildMainMenu();
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
@@ -166,7 +161,6 @@ export default async function handler(req, res) {
         body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
       });
     }
-    // 1.2 频道选择列表（按名字显示）
     else if (action === 'select_channel') {
       const channels = await getChannelsInfo();
       const buttons = channels.map(c => ([
@@ -186,7 +180,6 @@ export default async function handler(req, res) {
         })
       });
     }
-    // 1.3 查看某个具体频道
     else if (action.startsWith('view_chan_')) {
       const chanId = action.replace('view_chan_', '');
       const count = await getChannelKeyCount(chanId);
@@ -218,7 +211,6 @@ export default async function handler(req, res) {
         })
       });
     }
-    // 1.4 执行清空指定频道
     else if (action.startsWith('clean_chan_')) {
       const chanId = action.replace('clean_chan_', '');
       const resClean = await clearChannelKeys(chanId);
@@ -238,7 +230,6 @@ export default async function handler(req, res) {
         })
       });
     }
-    // 1.5 切换去重开关
     else if (action === 'toggle_dedup') {
       const settings = await getBotSettings();
       await redisCmd('set', 'config:dedup_enabled', settings.dedupEnabled ? '0' : '1');
@@ -249,7 +240,6 @@ export default async function handler(req, res) {
         body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
       });
     }
-    // 1.6 切换私发备份开关
     else if (action === 'toggle_backup') {
       const settings = await getBotSettings();
       await redisCmd('set', 'config:backup_enabled', settings.backupEnabled ? '0' : '1');
@@ -260,7 +250,6 @@ export default async function handler(req, res) {
         body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
       });
     }
-    // 1.7 一键清空全局确认
     else if (action === 'confirm_clean_all') {
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
         method: 'POST',
@@ -281,7 +270,6 @@ export default async function handler(req, res) {
         })
       });
     }
-    // 1.8 执行清空全局
     else if (action === 'do_clean_all') {
       const resClean = await clearChannelKeys(null);
       const msgText = resClean.ok ? `✅ **全局清理成功！** 共清除 \`${resClean.count}\` 条数据库记录。` : `❌ 清理失败：${resClean.error}`;
@@ -297,17 +285,14 @@ export default async function handler(req, res) {
         })
       });
     }
-    // 1.9 一键系统健康检测
     else if (action === 'system_health') {
       let report = `🩺 **系统健康自检报告**\n\n`;
 
-      // 检测 Redis 连通
       const startT = Date.now();
       const pingRes = await redisCmd('ping');
       const delay = Date.now() - startT;
       report += `💾 **Redis 数据库：** ${pingRes.ok ? `✅ 正常 (${delay}ms)` : `❌ 异常 (${pingRes.error})`}\n\n`;
 
-      // 检测频道权限
       report += `📢 **频道管理员权限检测：**\n`;
       const channels = await getChannelsInfo();
       for (const c of channels) {
@@ -397,7 +382,7 @@ export default async function handler(req, res) {
 
   const settings = await getBotSettings();
 
-  // 2.3 去重判别（仅在去重开关开启时生效）
+  // 2.3 去重判别（保持原有的 Redis SET NX 逻辑）
   if (uniqueId && settings.dedupEnabled) {
     const redisKey = `file:${currentChatId}:${uniqueId}`;
     const setRes = await redisCmd('set', redisKey, '1', 'NX');
@@ -406,73 +391,61 @@ export default async function handler(req, res) {
     if (setRes.ok && setRes.result !== 'OK') {
       console.log(`[Duplicate Found] 拦截到重复文件: ${uniqueId}`);
 
-      // 私发备份（仅在私发开关开启时生效）
-      if (settings.backupEnabled && ADMIN_USER_ID) {
-        await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: ADMIN_USER_ID,
-            from_chat_id: currentChatId,
-            message_id: messageId,
-            disable_notification: true
-          })
-        });
+      try {
+        // 私发备份（改用 copyMessage，去除管理员收到的消息源）
+        if (settings.backupEnabled && ADMIN_USER_ID) {
+          await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({
+              chat_id: ADMIN_USER_ID,
+              from_chat_id: currentChatId,
+              message_id: messageId
+            })
+          });
 
-        await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
+          await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({
+              chat_id: ADMIN_USER_ID,
+              text: `⚠️ **[自动去重备份]**\n已拦截频道 \`${currentChatId}\` 中的重复媒体！\n原重复消息已在上方备份 ⬆️`,
+              parse_mode: 'Markdown'
+            })
+          });
+        }
+      } finally {
+        // 无论备份成功与否，必定删除原重复消息
+        await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
           method: 'POST',
           headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: ADMIN_USER_ID,
-            text: `⚠️ **[自动去重备份]**\n已拦截频道 \`${currentChatId}\` 中的重复媒体！\n原重复消息已在上方备份 ⬆️`,
-            parse_mode: 'Markdown'
-          })
+          body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
         });
       }
-
-      // 删除频道重复消息
-      await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
-      });
 
       return res.status(200).send('OK - Duplicate Cleaned');
     }
   }
 
-  // 2.4 全新文件重发美化排版
-  let method = '';
-  const copyBody = { chat_id: currentChatId, show_caption_above_media: true }; 
-
-  if (video) { method = 'sendVideo'; copyBody.video = video.file_id; }
-  else if (photo) { method = 'sendPhoto'; copyBody.photo = photo[photo.length - 1].file_id; }
-  else if (animation) { method = 'sendAnimation'; copyBody.animation = animation.file_id; }
-  else if (document) {
-    const mime = document.mime_type || '';
-    if (mime.startsWith('video/')) { method = 'sendVideo'; copyBody.video = document.file_id; }
-    else if (mime.startsWith('image/')) { method = 'sendPhoto'; copyBody.photo = document.file_id; }
-    else { method = 'sendDocument'; copyBody.document = document.file_id; }
+  // 2.4 全新文件无缝“复制”（完全去除消息源 Header）
+  try {
+    await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        chat_id: currentChatId,
+        from_chat_id: currentChatId,
+        message_id: messageId
+      })
+    });
+  } finally {
+    // 放入 finally，确保无论发送是否超时/成功，必定清理原消息，杜绝遗留
+    await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
+    });
   }
-
-  copyBody.caption = message.caption || '';
-  copyBody.caption_entities = message.caption_entities || [];
-
-  const copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify(copyBody)
-  });
-
-  if (!copyRes.ok || !copyRes.data?.ok) {
-    return res.status(200).send('OK - Rate Limited or Failed');
-  }
-
-  await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
-  });
 
   return res.status(200).send('OK');
 }
