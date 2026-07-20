@@ -1,12 +1,11 @@
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
-// 支持逗号分隔的多个频道 ID
 const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()) : [];
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
-const DELETE_URL = `${TELEGRAM_API}/deleteMessage`;
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-async function telegramFetch(url, options, timeoutMs = 3500) {
+// 快速请求封装，超时时间 2500ms
+async function telegramFetch(url, options, timeoutMs = 2500) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
@@ -14,15 +13,6 @@ async function telegramFetch(url, options, timeoutMs = 3500) {
     options.signal = controller.signal;
     const response = await fetch(url, options);
     clearTimeout(timeoutId);
-
-    if (response.status === 429) {
-      const errorData = await response.json().catch(() => ({}));
-      return { 
-        ok: false, 
-        isRateLimit: true, 
-        retryAfter: errorData.parameters?.retry_after || 2 
-      };
-    }
 
     if (!response.ok) return { ok: false, httpStatus: response.status };
     const data = await response.json();
@@ -40,102 +30,51 @@ export default async function handler(req, res) {
   if (!channel_post) return res.status(200).send('OK');
 
   if (!BOT_TOKEN || ALLOWED_CHANNELS.length === 0) {
-    return res.status(500).send('Configuration Error');
+    return res.status(200).send('OK - Config Missing');
   }
 
-  // 【动态识别】获取当前触发 Webhook 的频道 ID
   const currentChannelId = String(channel_post.chat.id);
   
-  // 检查该频道是否在允许的白名单内
   if (!ALLOWED_CHANNELS.includes(currentChannelId)) return res.status(200).send('OK');
   if (channel_post.author_signature === 'Bot' || channel_post.from?.is_bot) {
     return res.status(200).send('OK');
   }
 
-  const video = channel_post.video;
-  const photo = channel_post.photo;
-  const animation = channel_post.animation;
-  const document = channel_post.document;
-
-  // 【新增修改 1】：如果没有任何附件（纯文字消息），直接跳过不处理，留给其他机器人处理
+  // 忽略纯文本消息（根据需要保留）
+  const { video, photo, animation, document } = channel_post;
   if (!video && !photo && !animation && !document) {
-    return res.status(200).send('OK - Ignored Text Message');
+    return res.status(200).send('OK - Ignored Text');
   }
 
   const messageId = channel_post.message_id;
-  let method = '';
-  
-  // 【新增修改 2】：添加 show_caption_above_media: true 参数，让文字排版在文件上方
-  const copyBody = { 
-    chat_id: currentChannelId,
-    show_caption_above_media: true 
-  }; 
 
-  if (video) {
-    method = 'sendVideo';
-    copyBody.video = video.file_id;
-  } else if (photo) {
-    method = 'sendPhoto';
-    copyBody.photo = photo[photo.length - 1].file_id;
-  } else if (animation) {
-    method = 'sendAnimation';
-    copyBody.animation = animation.file_id;
-  } else if (document) {
-    const mime = document.mime_type || '';
-    if (mime.startsWith('video/')) {
-      method = 'sendVideo';
-      copyBody.video = document.file_id;
-    } else if (mime.startsWith('image/')) {
-      method = 'sendPhoto';
-      copyBody.photo = document.file_id;
-    } else {
-      method = 'sendDocument';
-      copyBody.document = document.file_id;
-    }
-  }
-
-  // 提取原始文字说明及格式（粗体、斜体、链接等）
-  copyBody.caption = channel_post.caption || '';
-  copyBody.caption_entities = channel_post.caption_entities || [];
-
-  const fetchOptions = {
+  // 使用 Telegram 原生的 copyMessage 方法，自动保留原消息的所有属性与媒体格式
+  const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify(copyBody)
-  };
-
-  let copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, fetchOptions);
-
-  if (!copyRes.ok && copyRes.isRateLimit && copyRes.retryAfter <= 2) {
-    await new Promise(resolve => setTimeout(resolve, copyRes.retryAfter * 1000));
-    copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, fetchOptions);
-  }
-
-  if (!copyRes.ok) {
-    if (copyRes.isRateLimit) return res.status(429).send('Too Many Requests');
-    if (copyRes.isTimeout || copyRes.httpStatus >= 500) return res.status(500).send('Telegram Error');
-    return res.status(200).send('OK');
-  }
-  if (!copyRes.data?.ok) {
-    if (copyRes.data?.error_code === 400) return res.status(200).send('OK');
-    return res.status(500).send('Business Error');
-  }
-
-  // 严格紧跟删除
-  const deleteRes = await telegramFetch(DELETE_URL, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: currentChannelId, message_id: messageId }) // 动态删除当前频道的旧消息
+    body: JSON.stringify({
+      chat_id: currentChannelId,
+      from_chat_id: currentChannelId,
+      message_id: messageId,
+      show_caption_above_media: true
+    })
   });
 
-  if (!deleteRes.ok && (deleteRes.isTimeout || deleteRes.isRateLimit)) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    await telegramFetch(DELETE_URL, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ chat_id: currentChannelId, message_id: messageId })
-    });
+  // 发送失败或遭遇限流，立即记录并返回 200 OK，防止 Telegram 触发重复 Webhook
+  if (!copyRes.ok || !copyRes.data?.ok) {
+    console.warn(`[Skip Msg ${messageId}] Copy failed or rate limited.`);
+    return res.status(200).send('OK - Failed or Rate Limited');
   }
+
+  // 复制成功后，单次尝试删除原消息
+  await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      chat_id: currentChannelId,
+      message_id: messageId
+    })
+  });
 
   return res.status(200).send('OK');
 }
