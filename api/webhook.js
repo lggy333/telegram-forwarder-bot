@@ -1,128 +1,211 @@
-// api/webhook.js - 故障安全与精确定位版
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
+const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()) : [];
+const ADMIN_USER_ID = process.env.ALLOWED_USER_ID || process.env.ADMIN_USER_ID;
+const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+// 1. 保持你原有的超时封装函数（2500ms 快速响应）
+async function telegramFetch(url, options, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    options.signal = controller.signal;
+    const response = await fetch(url, options);
+    clearTimeout(timeoutId);
+
+    if (response.status === 429) {
+      return { ok: false, isRateLimit: true };
+    }
+
+    if (!response.ok) return { ok: false, httpStatus: response.status };
+    const data = await response.json();
+    return { ok: true, data };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    return { ok: false, isTimeout: err.name === 'AbortError', error: err };
+  }
+}
+
+// 2. Upstash Redis 原子锁写入 (带超时与 Fail-Safe 机制)
+async function checkAndSetRedisNX(key, value = '1') {
+  if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) {
+    return { success: false, error: 'Upstash Config Missing' };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    const url = `${UPSTASH_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/NX`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${UPSTASH_REST_TOKEN}` },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    const data = await res.json();
+    if (res.status !== 200 || data.error) {
+      return { success: false, error: data.error || `HTTP ${res.status}` };
+    }
+
+    // result 为 "OK" 代表新文件写入成功；result 为 null 代表之前已存在（重复）
+    return { success: true, isDuplicate: data.result !== 'OK' };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    return { success: false, error: err.message };
+  }
+}
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(200).json({ status: 'ok', message: 'Webhook is active!' });
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+  const message = req.body?.channel_post || req.body?.message;
+  if (!message) return res.status(200).send('OK');
+
+  if (!BOT_TOKEN || ALLOWED_CHANNELS.length === 0) {
+    return res.status(200).send('OK - Config Missing');
   }
 
-  const update = req.body;
-  const message = update.channel_post || update.message;
+  const currentChatId = String(message.chat.id);
+  const isPrivate = message.chat.type === 'private';
 
-  if (!message) {
-    return res.status(200).json({ status: 'ignored', reason: 'No message content' });
+  // 频道白名单拦截（私聊消息放行）
+  if (!isPrivate && !ALLOWED_CHANNELS.includes(currentChatId)) {
+    return res.status(200).send('OK');
   }
 
-  const BOT_TOKEN = process.env.BOT_TOKEN;
-  const ADMIN_USER_ID = process.env.ALLOWED_USER_ID || process.env.ADMIN_USER_ID;
-  const CHANNEL_IDS = (process.env.CHANNEL_ID || '').split(',').map(id => id.trim());
-  const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
-  const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  const chatId = String(message.chat.id);
-
-  if (CHANNEL_IDS.length > 0 && CHANNEL_IDS[0] !== '' && !CHANNEL_IDS.includes(chatId)) {
-    return res.status(200).json({ status: 'ignored', reason: 'Channel not in whitelist' });
+  // 忽略机器人自己发布的消息，防止无限死循环
+  if (message.author_signature === 'Bot' || message.from?.is_bot) {
+    return res.status(200).send('OK');
   }
 
-  const mediaInfo = getMediaInfo(message);
-  if (!mediaInfo) {
-    return res.status(200).json({ status: 'passed', reason: 'Not a media message' });
+  const video = message.video;
+  const photo = message.photo;
+  const animation = message.animation;
+  const document = message.document;
+
+  if (!video && !photo && !animation && !document) {
+    return res.status(200).send('OK - Ignored Text');
   }
 
-  console.log(`\n------------------ 收到新媒体消息 ------------------`);
-  console.log(`消息 ID: ${message.message_id} | 类型: ${mediaInfo.type}`);
-  console.log(`Telegram Unique ID: ${mediaInfo.uniqueId}`);
+  const messageId = message.message_id;
 
-  const redisKey = `file:${chatId}:${mediaInfo.uniqueId}`;
+  // 提取文件唯一特征 ID (file_unique_id)
+  let uniqueId = null;
+  if (video) uniqueId = video.file_unique_id;
+  else if (photo) uniqueId = photo[photo.length - 1].file_unique_id;
+  else if (animation) uniqueId = animation.file_unique_id;
+  else if (document) uniqueId = document.file_unique_id;
 
-  // 发起 Redis SET NX 请求
-  const { success, isDuplicate, error } = await checkAndSetRedisNX(UPSTASH_REST_URL, UPSTASH_REST_TOKEN, redisKey, '1');
+  // =========================================================
+  // 核心逻辑 A：Upstash Redis 去重校验
+  // =========================================================
+  if (uniqueId) {
+    const redisKey = `file:${isPrivate ? 'private' : currentChatId}:${uniqueId}`;
+    const redisRes = await checkAndSetRedisNX(redisKey);
 
-  // 1. 如果 Redis 本身报错（如 401 Token 错误），绝对不能删消息！
-  if (!success) {
-    console.error(`❌ [数据库报错] Redis 请求失败: ${error}，为保护数据，不执行删除动作。`);
-    return res.status(200).json({ status: 'error', reason: 'Redis Error, safety bypassed' });
-  }
+    // 1. 如果 Redis 报错（如 401 密钥失效或网络超时），执行 Fail-Safe：绝不删消息，直接放行
+    if (!redisRes.success) {
+      console.warn(`[Redis Fail] ${redisRes.error}，跳过去重校验以保护消息安全。`);
+    } 
+    // 2. 确认是真实重复文件
+    else if (redisRes.isDuplicate) {
+      console.log(`[Duplicate Found] 拦截到重复文件 ID: ${uniqueId}`);
 
-  // 2. 确定是真实重复文件（Redis Key 已存在，SET NX 返回 null）
-  if (isDuplicate) {
-    console.log(`🚨 [确认重复文件] 消息 ID: ${message.message_id} 已在频道中发送过！`);
+      // 动作一：先将重复原消息静音转发到你的私聊做备份
+      if (ADMIN_USER_ID) {
+        await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
+          method: 'POST',
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            chat_id: ADMIN_USER_ID,
+            from_chat_id: currentChatId,
+            message_id: messageId,
+            disable_notification: true
+          })
+        });
 
-    if (ADMIN_USER_ID) {
-      await tgFetch(BOT_TOKEN, 'forwardMessage', {
-        chat_id: ADMIN_USER_ID,
-        from_chat_id: chatId,
-        message_id: message.message_id,
-        disable_notification: true
+        // 动作二：发送重复通知给你的私聊
+        await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
+          method: 'POST',
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            chat_id: ADMIN_USER_ID,
+            text: `⚠️ **[自动去重备份]**\n已拦截并清理频道/聊天 \`${currentChatId}\` 中的重复媒体文件！\n原重复消息已在上方备份 ⬆️`,
+            parse_mode: 'Markdown'
+          })
+        });
+      }
+
+      // 动作三：备份完成后，彻底安全地删掉频道里的重复消息
+      await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
       });
 
-      await tgFetch(BOT_TOKEN, 'sendMessage', {
-        chat_id: ADMIN_USER_ID,
-        text: `⚠️ **[自动去重通知]**\n检测到频道 \`${chatId}\` 存在重复文件！\n类型: \`${mediaInfo.type}\` | ID: \`${mediaInfo.uniqueId}\`\n原消息已备份到上方 ⬆️，频道重复消息已清理。`,
-        parse_mode: 'Markdown'
-      });
+      return res.status(200).send('OK - Duplicate Cleaned');
     }
-
-    await tgFetch(BOT_TOKEN, 'deleteMessage', {
-      chat_id: chatId,
-      message_id: message.message_id
-    });
-    console.log(`✅ 已完成备份与重复清理。`);
-  } else {
-    // 3. 全新文件，首次写入成功
-    console.log(`✅ [全新文件] 已成功录入 Redis，保留在频道。`);
   }
 
-  console.log(`----------------------------------------------------\n`);
-  return res.status(200).json({ status: 'success' });
-}
+  // =========================================================
+  // 核心逻辑 B：全新文件，执行你源码的原版重发与美化逻辑
+  // =========================================================
+  let method = '';
+  const copyBody = { 
+    chat_id: isPrivate ? ALLOWED_CHANNELS[0] : currentChatId, // 私聊自动转发到目标频道
+    show_caption_above_media: true 
+  }; 
 
-function getMediaInfo(msg) {
-  if (msg.photo) return { type: 'photo', uniqueId: msg.photo[msg.photo.length - 1].file_unique_id };
-  if (msg.video) return { type: 'video', uniqueId: msg.video.file_unique_id };
-  if (msg.animation) return { type: 'animation', uniqueId: msg.animation.file_unique_id };
-  if (msg.document) return { type: 'document', uniqueId: msg.document.file_unique_id };
-  if (msg.audio) return { type: 'audio', uniqueId: msg.audio.file_unique_id };
-  if (msg.voice) return { type: 'voice', uniqueId: msg.voice.file_unique_id };
-  return null;
-}
-
-/**
- * 严谨判断 Redis 返回状态
- */
-async function checkAndSetRedisNX(url, token, key, value) {
-  try {
-    const fetchUrl = `${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/NX`;
-    const res = await fetch(fetchUrl, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const data = await res.json();
-
-    if (res.status !== 200 || data.error) {
-      return { success: false, isDuplicate: false, error: data.error || `HTTP ${res.status}` };
-    }
-
-    // SET ... NX 成功时 data.result 为 "OK"
-    // Key 已存在时 data.result 为 null
-    if (data.result === 'OK') {
-      return { success: true, isDuplicate: false };
+  if (video) {
+    method = 'sendVideo';
+    copyBody.video = video.file_id;
+  } else if (photo) {
+    method = 'sendPhoto';
+    copyBody.photo = photo[photo.length - 1].file_id;
+  } else if (animation) {
+    method = 'sendAnimation';
+    copyBody.animation = animation.file_id;
+  } else if (document) {
+    const mime = document.mime_type || '';
+    if (mime.startsWith('video/')) {
+      method = 'sendVideo';
+      copyBody.video = document.file_id;
+    } else if (mime.startsWith('image/')) {
+      method = 'sendPhoto';
+      copyBody.photo = document.file_id;
     } else {
-      return { success: true, isDuplicate: true };
+      method = 'sendDocument';
+      copyBody.document = document.file_id;
     }
-  } catch (err) {
-    return { success: false, isDuplicate: false, error: err.message };
   }
-}
 
-async function tgFetch(token, method, body) {
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    return await res.json();
-  } catch (err) {
-    return { ok: false };
+  copyBody.caption = message.caption || '';
+  copyBody.caption_entities = message.caption_entities || [];
+
+  // 1. 发送美化后的新消息（顶置字幕）
+  const copyRes = await telegramFetch(`${TELEGRAM_API}/${method}`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(copyBody)
+  });
+
+  if (!copyRes.ok || !copyRes.data?.ok) {
+    console.warn(`[Skip Msg ${messageId}] Send failed or rate limited.`);
+    return res.status(200).send('OK - Rate Limited or Failed');
   }
+
+  // 2. 只有新消息发送成功后，才删除用户/手动发出的原帖子
+  await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
+  });
+
+  return res.status(200).send('OK');
 }
