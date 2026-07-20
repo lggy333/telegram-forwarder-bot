@@ -1,4 +1,4 @@
-// api/webhook.js - 增强日志版
+// api/webhook.js - 故障安全与精确定位版
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -24,116 +24,96 @@ export default async function handler(req, res) {
     return res.status(200).json({ status: 'ignored', reason: 'Channel not in whitelist' });
   }
 
-  // 1. 详细提取并打印媒体文件信息
   const mediaInfo = getMediaInfo(message);
-
   if (!mediaInfo) {
-    console.log(`[消息跳过] 消息 ID ${message.message_id} 不包含媒体文件（纯文本）。`);
     return res.status(200).json({ status: 'passed', reason: 'Not a media message' });
   }
 
   console.log(`\n------------------ 收到新媒体消息 ------------------`);
-  console.log(`消息 ID: ${message.message_id}`);
-  console.log(`频道 ID: ${chatId}`);
-  console.log(`媒体类型: ${mediaInfo.type}`);
-  console.log(`文件名/特征: ${mediaInfo.fileName || '无文件名称'}`);
+  console.log(`消息 ID: ${message.message_id} | 类型: ${mediaInfo.type}`);
   console.log(`Telegram Unique ID: ${mediaInfo.uniqueId}`);
 
   const redisKey = `file:${chatId}:${mediaInfo.uniqueId}`;
-  console.log(`生成 Redis Key: ${redisKey}`);
 
-  // 2. 请求 Upstash Redis 并打印完整响应
-  const redisResult = await setRedisNXWithLog(UPSTASH_REST_URL, UPSTASH_REST_TOKEN, redisKey, '1');
+  // 发起 Redis SET NX 请求
+  const { success, isDuplicate, error } = await checkAndSetRedisNX(UPSTASH_REST_URL, UPSTASH_REST_TOKEN, redisKey, '1');
 
-  if (redisResult !== 'OK') {
-    console.log(`🚨 [判定为重复] Redis 返回非 'OK' (实际返回: ${JSON.stringify(redisResult)})`);
-    console.log(`正在触发备份并清理消息 ID: ${message.message_id}...`);
+  // 1. 如果 Redis 本身报错（如 401 Token 错误），绝对不能删消息！
+  if (!success) {
+    console.error(`❌ [数据库报错] Redis 请求失败: ${error}，为保护数据，不执行删除动作。`);
+    return res.status(200).json({ status: 'error', reason: 'Redis Error, safety bypassed' });
+  }
+
+  // 2. 确定是真实重复文件（Redis Key 已存在，SET NX 返回 null）
+  if (isDuplicate) {
+    console.log(`🚨 [确认重复文件] 消息 ID: ${message.message_id} 已在频道中发送过！`);
 
     if (ADMIN_USER_ID) {
-      // 静音备份给管理员私聊
-      const fwdRes = await tgFetch(BOT_TOKEN, 'forwardMessage', {
+      await tgFetch(BOT_TOKEN, 'forwardMessage', {
         chat_id: ADMIN_USER_ID,
         from_chat_id: chatId,
         message_id: message.message_id,
         disable_notification: true
       });
-      console.log(`备份转发结果: ${fwdRes.ok ? '成功' : '失败'}`);
 
-      // 发送重复说明通知
       await tgFetch(BOT_TOKEN, 'sendMessage', {
         chat_id: ADMIN_USER_ID,
-        text: `⚠️ **[自动去重通知]**\n检测到频道 \`${chatId}\` 存在重复文件！\n类型: \`${mediaInfo.type}\` | ID: \`${mediaInfo.uniqueId}\`\n原消息已**备份到上方** ⬆️，频道内重复消息已清理。`,
+        text: `⚠️ **[自动去重通知]**\n检测到频道 \`${chatId}\` 存在重复文件！\n类型: \`${mediaInfo.type}\` | ID: \`${mediaInfo.uniqueId}\`\n原消息已备份到上方 ⬆️，频道重复消息已清理。`,
         parse_mode: 'Markdown'
       });
     }
 
-    // 删除频道消息
-    const delRes = await tgFetch(BOT_TOKEN, 'deleteMessage', {
+    await tgFetch(BOT_TOKEN, 'deleteMessage', {
       chat_id: chatId,
       message_id: message.message_id
     });
-    console.log(`删除频道消息结果: ${delRes.ok ? '成功' : '失败'}`);
-    console.log(`----------------------------------------------------\n`);
+    console.log(`✅ 已完成备份与重复清理。`);
   } else {
-    console.log(`✅ [判定为全新文件] Redis 写入 'OK'，成功录入数据库。`);
-    console.log(`----------------------------------------------------\n`);
+    // 3. 全新文件，首次写入成功
+    console.log(`✅ [全新文件] 已成功录入 Redis，保留在频道。`);
   }
 
+  console.log(`----------------------------------------------------\n`);
   return res.status(200).json({ status: 'success' });
 }
 
-/**
- * 获取媒体详细信息
- */
 function getMediaInfo(msg) {
-  if (msg.photo) {
-    const item = msg.photo[msg.photo.length - 1];
-    return { type: 'photo', uniqueId: item.file_unique_id };
-  }
-  if (msg.video) {
-    return { type: 'video', uniqueId: msg.video.file_unique_id, fileName: msg.video.file_name };
-  }
-  if (msg.animation) {
-    return { type: 'animation', uniqueId: msg.animation.file_unique_id };
-  }
-  if (msg.document) {
-    return { type: 'document', uniqueId: msg.document.file_unique_id, fileName: msg.document.file_name };
-  }
-  if (msg.audio) {
-    return { type: 'audio', uniqueId: msg.audio.file_unique_id, fileName: msg.audio.file_name };
-  }
-  if (msg.voice) {
-    return { type: 'voice', uniqueId: msg.voice.file_unique_id };
-  }
+  if (msg.photo) return { type: 'photo', uniqueId: msg.photo[msg.photo.length - 1].file_unique_id };
+  if (msg.video) return { type: 'video', uniqueId: msg.video.file_unique_id };
+  if (msg.animation) return { type: 'animation', uniqueId: msg.animation.file_unique_id };
+  if (msg.document) return { type: 'document', uniqueId: msg.document.file_unique_id };
+  if (msg.audio) return { type: 'audio', uniqueId: msg.audio.file_unique_id };
+  if (msg.voice) return { type: 'voice', uniqueId: msg.voice.file_unique_id };
   return null;
 }
 
 /**
- * Upstash Redis 写入带详细日志打印
+ * 严谨判断 Redis 返回状态
  */
-async function setRedisNXWithLog(url, token, key, value) {
+async function checkAndSetRedisNX(url, token, key, value) {
   try {
     const fetchUrl = `${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/NX`;
-    console.log(`[Redis 发起请求] GET ${fetchUrl}`);
-
     const res = await fetch(fetchUrl, {
       headers: { Authorization: `Bearer ${token}` }
     });
     const data = await res.json();
 
-    console.log(`[Redis 响应状态码] ${res.status}`);
-    console.log(`[Redis 响应内容]`, JSON.stringify(data));
+    if (res.status !== 200 || data.error) {
+      return { success: false, isDuplicate: false, error: data.error || `HTTP ${res.status}` };
+    }
 
-    return data.result;
+    // SET ... NX 成功时 data.result 为 "OK"
+    // Key 已存在时 data.result 为 null
+    if (data.result === 'OK') {
+      return { success: true, isDuplicate: false };
+    } else {
+      return { success: true, isDuplicate: true };
+    }
   } catch (err) {
-    console.error(`[Redis 请求报错]`, err);
-    return null;
+    return { success: false, isDuplicate: false, error: err.message };
   }
 }
 
-/**
- * Telegram API 请求封装
- */
 async function tgFetch(token, method, body) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -143,7 +123,6 @@ async function tgFetch(token, method, body) {
     });
     return await res.json();
   } catch (err) {
-    console.error(`Telegram API (${method}) 报错:`, err);
     return { ok: false };
   }
 }
