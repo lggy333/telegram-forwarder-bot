@@ -9,10 +9,11 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 性能监控全局状态 & 并发追踪 (冷启动识别 + 暖实例累计统计)
+// 性能监控全局状态 & 并发/计数追踪
 // ---------------------------------------------------------
 let isInstanceCold = true; // 实例首次加载标记
-let activeInFlightCount = 0; // 当前实例正在并发处理的请求数 (新增)
+let activeInFlightCount = 0; // 当前实例正在并发处理的请求数
+let instanceMessageCounter = 0; // 暖实例累积处理成功的消息序号 (新增)
 
 const perfStats = {
   count: 0,
@@ -23,12 +24,8 @@ const perfStats = {
   rateLimitCount: 0
 };
 
-// 辅助工具：随机抖动/延时 (Jitter)
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const getRandomJitter = (min = 20, max = 120) => Math.floor(Math.random() * (max - min + 1)) + min;
-
 // ---------------------------------------------------------
-// 核心网络请求封装 (带超时与 429 捕获)
+// 核心网络请求封装
 // ---------------------------------------------------------
 async function telegramFetch(url, options, timeoutMs = 7000) {
   const controller = new AbortController();
@@ -80,7 +77,6 @@ async function getBotSettings() {
   };
 }
 
-// 配置 15s 短时微缓存
 let cachedSettings = null;
 let cachedSettingsTime = 0;
 async function getBotSettingsCached() {
@@ -162,14 +158,10 @@ async function buildMainMenu() {
 }
 
 // ---------------------------------------------------------
-// 带 Trace 细节记录与 Jitter 避让的重试复制逻辑
+// 带 Trace 细节记录的 copyMessage 重试逻辑
 // ---------------------------------------------------------
 async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
-    // 引入 20ms~120ms 的随机错峰 Jitter，削平瞬间并发打到 Telegram API 的峰值
-    const jitterMs = getRandomJitter(20, 120);
-    await sleep(jitterMs);
-
     const tStart = performance.now();
     const res = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
@@ -179,9 +171,11 @@ async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRet
     const attemptMs = (performance.now() - tStart).toFixed(1);
 
     if (res.ok && res.data?.ok) {
+      instanceMessageCounter++; // 累积全局成功计次
+      trace.msgIndex = instanceMessageCounter; // 标记本次是第几条
       trace.copyAttempts.push({ 
         attempt: i + 1, 
-        status: `成功 (200 OK) [含Jitter: ${jitterMs}ms]`, 
+        status: `成功 (200 OK) [实例第 ${instanceMessageCounter} 条]`, 
         ms: attemptMs 
       });
       return { success: true };
@@ -192,10 +186,10 @@ async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRet
       const waitMs = (res.retryAfter * 1000) + 200;
       trace.copyAttempts.push({ 
         attempt: i + 1, 
-        status: `⚠️ 429 限流 (Telegram 要求等待 ${res.retryAfter}s, 自动避让 ${waitMs}ms)`, 
+        status: `⚠️ 429 限流 ( Telegram 强制要求等待 ${res.retryAfter}s )`, 
         ms: attemptMs 
       });
-      await sleep(waitMs);
+      await new Promise(r => setTimeout(r, waitMs));
       continue;
     }
 
@@ -205,19 +199,18 @@ async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRet
       status: `❌ 失败 HTTP ${res.httpStatus || 'Timeout'} (退避等待 ${waitMs}ms)`, 
       ms: attemptMs 
     });
-    await sleep(waitMs);
+    await new Promise(r => setTimeout(r, waitMs));
   }
   
   return { success: false };
 }
 
 // ---------------------------------------------------------
-// 打印日志格式化工具 (新增 Active In-Flight 并发数显示)
+// 打印日志格式化工具 (新增 MsgIndex 与 FileSize 观察点)
 // ---------------------------------------------------------
 function printTraceLog(trace, reqStartMs) {
   const totalMs = (performance.now() - reqStartMs).toFixed(1);
   
-  // 更新暖实例累加统计
   perfStats.count++;
   perfStats.redisMsSum += parseFloat(trace.redisMs || 0);
   perfStats.copyMsSum += parseFloat(trace.copyTotalMs || 0);
@@ -225,22 +218,22 @@ function printTraceLog(trace, reqStartMs) {
   perfStats.totalMsSum += parseFloat(totalMs);
 
   let attemptsDetail = trace.copyAttempts.map(a => 
-    `   └─ 第 ${a.attempt} 次尝试: ${a.status} -> Telegram响应耗时: ${a.ms}ms`
+    `   └─ 第 ${a.attempt} 次尝试: ${a.status} -> TG响应耗时: ${a.ms}ms`
   ).join('\n');
 
   console.log(`
 ==================================================
-📊 [Trace] 消息 ID: ${trace.messageId} | UniqueID: ${trace.uniqueId || 'None'}
-⏰ 收到请求: ${trace.timestamp} | 🧊 容器: ${trace.isCold ? '❄️ 冷启动' : '🔥 暖实例'} | ⚡ 当前实例并发数: ${trace.activeInFlight}
+📊 [Trace] 序号: #${trace.msgIndex || 'Duplicates'} | MessageID: ${trace.messageId} | UniqueID: ${trace.uniqueId || 'None'}
+📦 媒体类型: ${trace.mediaType} | 文件大小: ${trace.fileSizeFormatted}
+⏰ 收到请求: ${trace.timestamp} | 🧊 容器: ${trace.isCold ? '❄️ 冷启动' : '🔥 暖实例'} | ⚡ 实例并发: ${trace.activeInFlight}
 --------------------------------------------------
 💾 Redis 去重耗时:    ${trace.redisMs || 0} ms
 📤 CopyMessage 总耗时: ${trace.copyTotalMs || 0} ms
 ${attemptsDetail ? attemptsDetail + '\n' : ''}🗑️ DeleteMessage 耗时: ${trace.deleteMs || 0} ms
 --------------------------------------------------
-⏱️ Webhook 内部处理总耗时: ${totalMs} ms
+⏱️ Webhook 处理总耗时: ${totalMs} ms
 ==================================================`);
 
-  // 每处理 10 条消息输出一次累计分析
   if (perfStats.count % 10 === 0) {
     console.log(`
 📈 [统计] 当前容器累积处理 ${perfStats.count} 条消息均值报告：
@@ -261,20 +254,20 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
   const body = req.body || {};
 
-  // 增加当前实例活跃请求计数
   activeInFlightCount++;
 
-  // 捕获冷启动标记
   const currentReqIsCold = isInstanceCold;
   if (isInstanceCold) isInstanceCold = false;
 
-  // 初始化性能追踪对象
   const trace = {
+    msgIndex: null,
     messageId: 'Unknown',
     uniqueId: null,
+    mediaType: 'Unknown',
+    fileSizeFormatted: 'N/A',
     timestamp: new Date().toISOString().split('T')[1].slice(0, 12),
     isCold: currentReqIsCold,
-    activeInFlight: activeInFlightCount, // 记录此刻的并发数
+    activeInFlight: activeInFlightCount,
     redisMs: 0,
     copyTotalMs: 0,
     deleteMs: 0,
@@ -424,13 +417,33 @@ export default async function handler(req, res) {
     const messageId = message.message_id;
     trace.messageId = messageId;
 
+    // 提取 UniqueID 与计算 FileSize
     let uniqueId = null;
-    if (video) uniqueId = video.file_unique_id;
-    else if (photo) uniqueId = photo[photo.length - 1].file_unique_id;
-    else if (animation) uniqueId = animation.file_unique_id;
-    else if (document) uniqueId = document.file_unique_id;
+    let rawSizeBytes = 0;
+
+    if (video) {
+      uniqueId = video.file_unique_id;
+      rawSizeBytes = video.file_size || 0;
+      trace.mediaType = 'Video';
+    } else if (photo) {
+      const targetPhoto = photo[photo.length - 1];
+      uniqueId = targetPhoto.file_unique_id;
+      rawSizeBytes = targetPhoto.file_size || 0;
+      trace.mediaType = 'Photo';
+    } else if (animation) {
+      uniqueId = animation.file_unique_id;
+      rawSizeBytes = animation.file_size || 0;
+      trace.mediaType = 'Animation';
+    } else if (document) {
+      uniqueId = document.file_unique_id;
+      rawSizeBytes = document.file_size || 0;
+      trace.mediaType = 'Document';
+    }
 
     trace.uniqueId = uniqueId;
+    trace.fileSizeFormatted = rawSizeBytes > 0 
+      ? (rawSizeBytes > 1048576 ? `${(rawSizeBytes / 1048576).toFixed(2)} MB` : `${(rawSizeBytes / 1024).toFixed(1)} KB`)
+      : 'Unknown';
 
     const settings = await getBotSettingsCached();
 
@@ -465,12 +478,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2.4 全新文件复制去头流程 (带 Jitter 避让与单次尝试追踪)
+    // 2.4 全新文件 copyMessage 复制去头流程
     const tCopyStart = performance.now();
     const copyProcess = await copyMessageWithRetry(currentChatId, currentChatId, messageId, trace);
     trace.copyTotalMs = (performance.now() - tCopyStart).toFixed(1);
 
-    // 只有复制成功才删除原消息
     if (copyProcess.success) {
       const tDeleteStart = performance.now();
       await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
@@ -485,7 +497,6 @@ export default async function handler(req, res) {
     return res.status(200).send('OK');
 
   } finally {
-    // 请求结束，递减活跃请求计数
     activeInFlightCount--;
   }
 }
