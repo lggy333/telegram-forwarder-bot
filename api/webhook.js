@@ -9,7 +9,20 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 核心网络请求封装 (解析 429 和 retry_after)
+// 性能监控全局状态 (冷启动识别 + 暖实例累计统计)
+// ---------------------------------------------------------
+let isInstanceCold = true; // 实例首次加载标记
+const perfStats = {
+  count: 0,
+  redisMsSum: 0,
+  copyMsSum: 0,
+  deleteMsSum: 0,
+  totalMsSum: 0,
+  rateLimitCount: 0
+};
+
+// ---------------------------------------------------------
+// 核心网络请求封装 (带耗时计算)
 // ---------------------------------------------------------
 async function telegramFetch(url, options, timeoutMs = 7000) {
   const controller = new AbortController();
@@ -35,7 +48,7 @@ async function telegramFetch(url, options, timeoutMs = 7000) {
 }
 
 // ---------------------------------------------------------
-// Redis 操作封装 (保持不变)
+// Redis 操作封装
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -56,14 +69,12 @@ async function getBotSettings() {
   const dedupRes = await redisCmd('get', 'config:dedup_enabled');
   const backupRes = await redisCmd('get', 'config:backup_enabled');
   return {
-    dedupEnabled: dedupRes.result !== '0',   // 默认开启
-    backupEnabled: backupRes.result !== '0'  // 默认开启
+    dedupEnabled: dedupRes.result !== '0',   
+    backupEnabled: backupRes.result !== '0'  
   };
 }
 
-// ---------------------------------------------------------
-// 配置微缓存 (降低高并发下 Redis 读取压力)
-// ---------------------------------------------------------
+// 配置 15s 短时微缓存
 let cachedSettings = null;
 let cachedSettingsTime = 0;
 async function getBotSettingsCached() {
@@ -145,46 +156,104 @@ async function buildMainMenu() {
 }
 
 // ---------------------------------------------------------
-// 核心重试复制逻辑 (生产环境安全保障)
+// 带 Trace 细节记录的重试复制逻辑
 // ---------------------------------------------------------
-async function copyMessageWithRetry(chatId, fromChatId, messageId, maxRetries = 3) {
+async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
+    const tStart = performance.now();
     const res = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ chat_id: chatId, from_chat_id: fromChatId, message_id: messageId })
     });
+    const attemptMs = (performance.now() - tStart).toFixed(1);
 
-    // 复制成功，直接返回
     if (res.ok && res.data?.ok) {
-      console.log(`[Copy OK] 消息 ${messageId} 复制成功`);
+      trace.copyAttempts.push({ attempt: i + 1, status: '成功 (200 OK)', ms: attemptMs });
       return { success: true };
     }
 
-    // 遇到 429 限流
     if (res.isRateLimit) {
-      const waitMs = (res.retryAfter * 1000) + 200; // 额外加 200ms 缓冲
-      console.log(`[429] 触发限流，等待 ${waitMs}ms 后重试 (第 ${i+1}/${maxRetries} 次)...`);
+      perfStats.rateLimitCount++;
+      const waitMs = (res.retryAfter * 1000) + 200;
+      trace.copyAttempts.push({ attempt: i + 1, status: `⚠️ 429 限流 (自动触发避让 ${waitMs}ms)`, ms: attemptMs });
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      continue; // 继续下一次尝试
+      continue;
     }
 
-    // 其他未知错误或网络超时，使用指数退避 (500ms, 1000ms, 2000ms)
     const waitMs = 500 * Math.pow(2, i);
-    console.log(`[Copy Failed] HTTP ${res.httpStatus || 'Timeout'}，等待 ${waitMs}ms 后重试 (第 ${i+1}/${maxRetries} 次)...`);
+    trace.copyAttempts.push({ attempt: i + 1, status: `❌ 失败 HTTP ${res.httpStatus || 'Timeout'} (退避等待 ${waitMs}ms)`, ms: attemptMs });
     await new Promise(resolve => setTimeout(resolve, waitMs));
   }
   
-  console.log(`[Copy Error] 消息 ${messageId} 重试 ${maxRetries} 次后最终失败，放弃复制。`);
   return { success: false };
+}
+
+// ---------------------------------------------------------
+// 打印日志格式化工具
+// ---------------------------------------------------------
+function printTraceLog(trace, reqStartMs) {
+  const totalMs = (performance.now() - reqStartMs).toFixed(1);
+  
+  // 更新暖实例累加统计
+  perfStats.count++;
+  perfStats.redisMsSum += parseFloat(trace.redisMs || 0);
+  perfStats.copyMsSum += parseFloat(trace.copyTotalMs || 0);
+  perfStats.deleteMsSum += parseFloat(trace.deleteMs || 0);
+  perfStats.totalMsSum += parseFloat(totalMs);
+
+  let attemptsDetail = trace.copyAttempts.map(a => 
+    `  └─ 第 ${a.attempt} 次尝试: ${a.status} [耗时: ${a.ms}ms]`
+  ).join('\n');
+
+  console.log(`
+==================================================
+📊 [Trace] 消息 ID: ${trace.messageId} | UniqueID: ${trace.uniqueId || 'None'}
+⏰ 收到请求: ${trace.timestamp} | 🧊 容器状态: ${trace.isCold ? '❄️ 冷启动 (Cold)' : '🔥 暖实例 (Warm)'}
+--------------------------------------------------
+💾 Redis 去重耗时:    ${trace.redisMs || 0} ms
+📤 CopyMessage 总耗时: ${trace.copyTotalMs || 0} ms
+${attemptsDetail ? attemptsDetail + '\n' : ''}🗑️ DeleteMessage 耗时: ${trace.deleteMs || 0} ms
+--------------------------------------------------
+⏱️ Webhook 内部处理总耗时: ${totalMs} ms
+==================================================`);
+
+  // 每在同一个暖实例上处理 10 条消息，打印一次累计均值报告
+  if (perfStats.count % 10 === 0) {
+    console.log(`
+📈 [统计] 当前容器累积处理 ${perfStats.count} 条消息均值报告：
+• Redis  平均耗时: ${(perfStats.redisMsSum / perfStats.count).toFixed(1)} ms
+• Copy   平均耗时: ${(perfStats.copyMsSum / perfStats.count).toFixed(1)} ms
+• Delete 平均耗时: ${(perfStats.deleteMsSum / perfStats.count).toFixed(1)} ms
+• 全流程 平均耗时: ${(perfStats.totalMsSum / perfStats.count).toFixed(1)} ms
+• 触发 429 累计次数: ${perfStats.rateLimitCount} 次
+--------------------------------------------------`);
+  }
 }
 
 // ---------------------------------------------------------
 // 路由主入口
 // ---------------------------------------------------------
 export default async function handler(req, res) {
+  const reqStartMs = performance.now();
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
   const body = req.body || {};
+
+  // 捕获冷启动标记
+  const currentReqIsCold = isInstanceCold;
+  if (isInstanceCold) isInstanceCold = false;
+
+  // 初始化性能追踪对象
+  const trace = {
+    messageId: 'Unknown',
+    uniqueId: null,
+    timestamp: new Date().toISOString().split('T')[1].slice(0, 12),
+    isCold: currentReqIsCold,
+    redisMs: 0,
+    copyTotalMs: 0,
+    deleteMs: 0,
+    copyAttempts: []
+  };
 
   // =========================================================
   // 处理 1：点击交互按钮 (Callback Query)
@@ -198,9 +267,7 @@ export default async function handler(req, res) {
 
     if (ADMIN_USER_ID && userId !== String(ADMIN_USER_ID)) {
       await telegramFetch(`${TELEGRAM_API}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ callback_query_id: cbId, text: '⛔ 仅管理员可操作！', show_alert: true })
+        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ callback_query_id: cbId, text: '⛔ 仅管理员可操作！', show_alert: true })
       });
       return res.status(200).send('OK');
     }
@@ -210,9 +277,7 @@ export default async function handler(req, res) {
     if (action === 'menu_main') {
       const menu = await buildMainMenu();
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
+        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
       });
     }
     else if (action === 'select_channel') {
@@ -220,11 +285,7 @@ export default async function handler(req, res) {
       const buttons = channels.map(c => ([{ text: `📢 ${c.title}`, callback_data: `view_chan_${c.id}` }]));
       buttons.push([{ text: "⬅️ 返回主菜单", callback_data: "menu_main" }]);
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({
-          chat_id: chatId, message_id: msgId, text: `📢 **请点击要管理的频道名字：**`, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons }
-        })
+        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: `📢 **请点击要管理的频道名字：**`, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } })
       });
     }
     else if (action.startsWith('view_chan_')) {
@@ -234,13 +295,9 @@ export default async function handler(req, res) {
       const title = resChan.ok ? resChan.data.result.title : chanId;
 
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({
-          chat_id: chatId, message_id: msgId,
-          text: `📌 **频道名称：** \`${title}\`\n🆔 **频道 ID：** \`${chanId}\`\n💾 **已记录去重文件数：** \`${count}\` 个\n\n你可以点击下方按钮清空该频道的记忆，以便重新发送过往文件：`,
-          parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: [[{ text: `🗑️ 清空「${title}」的去重记忆`, callback_data: `clean_chan_${chanId}` }], [{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]] }
+        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({
+          chat_id: chatId, message_id: msgId, text: `📌 **频道名称：** \`${title}\`\n🆔 **频道 ID：** \`${chanId}\`\n💾 **已记录去重文件数：** \`${count}\` 个\n\n你可以点击下方按钮清空该频道的记忆，以便重新发送过往文件：`,
+          parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: `🗑️ 清空「${title}」的去重记忆`, callback_data: `clean_chan_${chanId}` }], [{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]] }
         })
       });
     }
@@ -249,22 +306,20 @@ export default async function handler(req, res) {
       const resClean = await clearChannelKeys(chanId);
       const msgText = resClean.ok ? `✅ **清理完成！**\n已清空该频道 \`${resClean.count}\` 条文件记忆。` : `❌ 清理失败：${resClean.error}`;
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({
-          chat_id: chatId, message_id: msgId, text: msgText, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]] }
-        })
+        method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: msgText, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]] } })
       });
     }
     else if (action === 'toggle_dedup') {
       const settings = await getBotSettingsCached();
       await redisCmd('set', 'config:dedup_enabled', settings.dedupEnabled ? '0' : '1');
-      cachedSettings = null; // 无效化缓存
+      cachedSettings = null; 
       const menu = await buildMainMenu();
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup }) });
     }
     else if (action === 'toggle_backup') {
       const settings = await getBotSettingsCached();
       await redisCmd('set', 'config:backup_enabled', settings.backupEnabled ? '0' : '1');
-      cachedSettings = null; // 无效化缓存
+      cachedSettings = null; 
       const menu = await buildMainMenu();
       await telegramFetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup }) });
     }
@@ -340,22 +395,27 @@ export default async function handler(req, res) {
   if (!video && !photo && !animation && !document) return res.status(200).send('OK - Ignored Text');
 
   const messageId = message.message_id;
+  trace.messageId = messageId;
+
   let uniqueId = null;
   if (video) uniqueId = video.file_unique_id;
   else if (photo) uniqueId = photo[photo.length - 1].file_unique_id;
   else if (animation) uniqueId = animation.file_unique_id;
   else if (document) uniqueId = document.file_unique_id;
 
+  trace.uniqueId = uniqueId;
+
   const settings = await getBotSettingsCached();
 
-  // 2.3 去重判别
+  // 2.3 Redis 去重判断 (计时)
   if (uniqueId && settings.dedupEnabled) {
+    const tRedisStart = performance.now();
     const redisKey = `file:${currentChatId}:${uniqueId}`;
     const setRes = await redisCmd('set', redisKey, '1', 'NX');
+    trace.redisMs = (performance.now() - tRedisStart).toFixed(1);
 
     // 如果未返回 OK，说明已存在该文件 (重复文件拦截)
     if (setRes.ok && setRes.result !== 'OK') {
-      console.log(`[Duplicate Found] 拦截到重复文件: ${uniqueId}`);
       try {
         if (settings.backupEnabled && ADMIN_USER_ID) {
           const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
@@ -368,28 +428,34 @@ export default async function handler(req, res) {
           }
         }
       } finally {
-        // 重复文件直接无条件删除
+        const tDelStart = performance.now();
         await telegramFetch(`${TELEGRAM_API}/deleteMessage`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: currentChatId, message_id: messageId }) });
+        trace.deleteMs = (performance.now() - tDelStart).toFixed(1);
       }
+      
+      printTraceLog(trace, reqStartMs);
       return res.status(200).send('OK - Duplicate Cleaned');
     }
   }
 
-  // 2.4 全新文件无缝“复制”去头流程 (带有重试机制和成功校验)
-  const copyProcess = await copyMessageWithRetry(currentChatId, currentChatId, messageId);
+  // 2.4 全新文件无缝“复制”去头流程 (带重试 & 耗时追踪)
+  const tCopyStart = performance.now();
+  const copyProcess = await copyMessageWithRetry(currentChatId, currentChatId, messageId, trace);
+  trace.copyTotalMs = (performance.now() - tCopyStart).toFixed(1);
 
-  // 【核心修复】：只有在复制确实成功的情况下，才删除原来的消息。
+  // 只有复制成功才删除原消息
   if (copyProcess.success) {
-    const deleteRes = await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+    const tDeleteStart = performance.now();
+    await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
     });
-    console.log(`[Delete OK] 删除原消息 ${messageId}: ${deleteRes.ok ? '成功' : '失败'}`);
-  } else {
-    // 如果重试 3 次仍然遇到 429 或者其他崩溃，则跳过删除流程
-    console.log(`[Delete Skip] 消息 ${messageId} 复制失败，跳过删除步骤，保护原文件不丢失。`);
+    trace.deleteMs = (performance.now() - tDeleteStart).toFixed(1);
   }
+
+  // 输出分析报告
+  printTraceLog(trace, reqStartMs);
 
   return res.status(200).send('OK');
 }
