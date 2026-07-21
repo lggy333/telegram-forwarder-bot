@@ -9,11 +9,16 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 性能监控全局状态 & 并发/计数追踪
+// 全局状态 & 自适应限速器 (Rate Limiter Config)
 // ---------------------------------------------------------
-let isInstanceCold = true; // 实例首次加载标记
-let activeInFlightCount = 0; // 当前实例正在并发处理的请求数
-let instanceMessageCounter = 0; // 暖实例累积处理成功的消息序号 (新增)
+let isInstanceCold = true; 
+let activeInFlightCount = 0; 
+let instanceMessageCounter = 0; // 全局成功计次
+
+// 限速器参数配置
+const PACE_INTERVAL_MS = 350;   // 每条消息基础平滑间隔 (保持在 ~2.5 TPS)
+const BATCH_SIZE = 30;          // 每 30 条触发一次批次冷却
+const BATCH_COOL_MS = 2000;     // 批次主动休眠 2 秒，给 TG 漏桶清空时间
 
 const perfStats = {
   count: 0,
@@ -24,29 +29,43 @@ const perfStats = {
   rateLimitCount: 0
 };
 
+// 工具函数：Sleep
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // ---------------------------------------------------------
-// 核心网络请求封装
+// 核心网络请求 (带精准 API 路径及 429 细节日志)
 // ---------------------------------------------------------
 async function telegramFetch(url, options, timeoutMs = 7000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
+  const apiMethod = url.split('/').pop(); // 提取调用的方法名（如 copyMessage）
+  const startT = performance.now();
+
   try {
     options.signal = controller.signal;
     const response = await fetch(url, options);
     clearTimeout(timeoutId);
 
     const data = await response.json().catch(() => null);
+    const networkMs = (performance.now() - startT).toFixed(1);
 
     if (response.status === 429) {
       const retryAfter = data?.parameters?.retry_after || 1;
-      return { ok: false, isRateLimit: true, retryAfter };
+      console.warn(`🚨 [TG 429 限流通知] 方法: ${apiMethod} | 耗时: ${networkMs}ms | 完整响应:`, JSON.stringify(data));
+      return { ok: false, isRateLimit: true, retryAfter, networkMs, data };
     }
-    if (!response.ok) return { ok: false, httpStatus: response.status, data };
-    return { ok: true, data };
+
+    if (!response.ok) {
+      console.error(`❌ [TG API 错误] 方法: ${apiMethod} | Status: ${response.status} | 耗时: ${networkMs}ms | Body:`, JSON.stringify(data));
+      return { ok: false, httpStatus: response.status, data, networkMs };
+    }
+
+    return { ok: true, data, networkMs };
   } catch (err) {
     clearTimeout(timeoutId);
-    return { ok: false, isTimeout: err.name === 'AbortError', error: err };
+    const networkMs = (performance.now() - startT).toFixed(1);
+    return { ok: false, isTimeout: err.name === 'AbortError', error: err, networkMs };
   }
 }
 
@@ -158,26 +177,40 @@ async function buildMainMenu() {
 }
 
 // ---------------------------------------------------------
-// 带 Trace 细节记录的 copyMessage 重试逻辑
+// 带 Trace 细节记录与主动平滑限速的 copyMessage 逻辑
 // ---------------------------------------------------------
 async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
-    const tStart = performance.now();
     const res = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ chat_id: chatId, from_chat_id: fromChatId, message_id: messageId })
     });
-    const attemptMs = (performance.now() - tStart).toFixed(1);
 
     if (res.ok && res.data?.ok) {
-      instanceMessageCounter++; // 累积全局成功计次
-      trace.msgIndex = instanceMessageCounter; // 标记本次是第几条
+      instanceMessageCounter++; // 成功计数
+      trace.msgIndex = instanceMessageCounter;
       trace.copyAttempts.push({ 
         attempt: i + 1, 
         status: `成功 (200 OK) [实例第 ${instanceMessageCounter} 条]`, 
-        ms: attemptMs 
+        ms: res.networkMs 
       });
+
+      // ---------------------------------------------------------
+      // 🔥 智能主动限速控制 (Adaptive Rate Limiting)
+      // ---------------------------------------------------------
+      let activeDelayMs = PACE_INTERVAL_MS;
+      let delayReason = `基础间隔 (${PACE_INTERVAL_MS}ms)`;
+
+      // 每 30 条额外增加 2 秒全局冷却，清空 Telegram 漏桶
+      if (instanceMessageCounter % BATCH_SIZE === 0) {
+        activeDelayMs += BATCH_COOL_MS;
+        delayReason = `触发 30 条批次缓冲，额外冷却 ${BATCH_COOL_MS}ms (总休眠 ${activeDelayMs}ms)`;
+      }
+
+      trace.pacingNotice = delayReason;
+      await sleep(activeDelayMs);
+
       return { success: true };
     }
 
@@ -186,10 +219,10 @@ async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRet
       const waitMs = (res.retryAfter * 1000) + 200;
       trace.copyAttempts.push({ 
         attempt: i + 1, 
-        status: `⚠️ 429 限流 ( Telegram 强制要求等待 ${res.retryAfter}s )`, 
-        ms: attemptMs 
+        status: `⚠️ 429 被动限流 ( Telegram 要求等待 ${res.retryAfter}s )`, 
+        ms: res.networkMs 
       });
-      await new Promise(r => setTimeout(r, waitMs));
+      await sleep(waitMs);
       continue;
     }
 
@@ -197,16 +230,16 @@ async function copyMessageWithRetry(chatId, fromChatId, messageId, trace, maxRet
     trace.copyAttempts.push({ 
       attempt: i + 1, 
       status: `❌ 失败 HTTP ${res.httpStatus || 'Timeout'} (退避等待 ${waitMs}ms)`, 
-      ms: attemptMs 
-    });
-    await new Promise(r => setTimeout(r, waitMs));
+      ms: res.networkMs 
+      });
+    await sleep(waitMs);
   }
   
   return { success: false };
 }
 
 // ---------------------------------------------------------
-// 打印日志格式化工具 (新增 MsgIndex 与 FileSize 观察点)
+// 日志输出逻辑
 // ---------------------------------------------------------
 function printTraceLog(trace, reqStartMs) {
   const totalMs = (performance.now() - reqStartMs).toFixed(1);
@@ -218,20 +251,21 @@ function printTraceLog(trace, reqStartMs) {
   perfStats.totalMsSum += parseFloat(totalMs);
 
   let attemptsDetail = trace.copyAttempts.map(a => 
-    `   └─ 第 ${a.attempt} 次尝试: ${a.status} -> TG响应耗时: ${a.ms}ms`
+    `   └─ 第 ${a.attempt} 次尝试: ${a.status} -> TG API耗时: ${a.ms}ms`
   ).join('\n');
 
   console.log(`
 ==================================================
 📊 [Trace] 序号: #${trace.msgIndex || 'Duplicates'} | MessageID: ${trace.messageId} | UniqueID: ${trace.uniqueId || 'None'}
 📦 媒体类型: ${trace.mediaType} | 文件大小: ${trace.fileSizeFormatted}
-⏰ 收到请求: ${trace.timestamp} | 🧊 容器: ${trace.isCold ? '❄️ 冷启动' : '🔥 暖实例'} | ⚡ 实例并发: ${trace.activeInFlight}
+⏰ 收到时间: ${trace.timestamp} | 🧊 状态: ${trace.isCold ? '❄️ 冷启动' : '🔥 暖实例'} | ⚡ 并发数: ${trace.activeInFlight}
+🌐 主动限速: ${trace.pacingNotice || '无'}
 --------------------------------------------------
 💾 Redis 去重耗时:    ${trace.redisMs || 0} ms
 📤 CopyMessage 总耗时: ${trace.copyTotalMs || 0} ms
 ${attemptsDetail ? attemptsDetail + '\n' : ''}🗑️ DeleteMessage 耗时: ${trace.deleteMs || 0} ms
 --------------------------------------------------
-⏱️ Webhook 处理总耗时: ${totalMs} ms
+⏱️ Webhook 整体处理耗时: ${totalMs} ms
 ==================================================`);
 
   if (perfStats.count % 10 === 0) {
@@ -268,6 +302,7 @@ export default async function handler(req, res) {
     timestamp: new Date().toISOString().split('T')[1].slice(0, 12),
     isCold: currentReqIsCold,
     activeInFlight: activeInFlightCount,
+    pacingNotice: '',
     redisMs: 0,
     copyTotalMs: 0,
     deleteMs: 0,
@@ -275,9 +310,7 @@ export default async function handler(req, res) {
   };
 
   try {
-    // =========================================================
-    // 处理 1：点击交互按钮 (Callback Query)
-    // =========================================================
+    // 1. 处理 Callback Query
     if (body.callback_query) {
       const cb = body.callback_query;
       const userId = String(cb.from.id);
@@ -384,9 +417,7 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // =========================================================
-    // 处理 2：常规频道/私聊消息
-    // =========================================================
+    // 2. 常规消息处理
     const message = body.channel_post || body.message;
     if (!message) return res.status(200).send('OK');
     if (!BOT_TOKEN || ALLOWED_CHANNELS.length === 0) return res.status(200).send('OK - Config Missing');
@@ -395,7 +426,6 @@ export default async function handler(req, res) {
     const isPrivate = message.chat.type === 'private';
     const userId = String(message.from?.id || '');
 
-    // 2.1 私聊触发主菜单
     if (isPrivate) {
       if (ADMIN_USER_ID && userId !== String(ADMIN_USER_ID)) return res.status(200).send('OK - Unauthorized');
       const menu = await buildMainMenu();
@@ -403,7 +433,6 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // 2.2 频道处理逻辑
     if (!ALLOWED_CHANNELS.includes(currentChatId)) return res.status(200).send('OK');
     if (message.author_signature === 'Bot' || message.from?.is_bot) return res.status(200).send('OK');
 
@@ -417,7 +446,6 @@ export default async function handler(req, res) {
     const messageId = message.message_id;
     trace.messageId = messageId;
 
-    // 提取 UniqueID 与计算 FileSize
     let uniqueId = null;
     let rawSizeBytes = 0;
 
@@ -447,14 +475,13 @@ export default async function handler(req, res) {
 
     const settings = await getBotSettingsCached();
 
-    // 2.3 Redis 去重判断
+    // 2.1 Redis 去重判断
     if (uniqueId && settings.dedupEnabled) {
       const tRedisStart = performance.now();
       const redisKey = `file:${currentChatId}:${uniqueId}`;
       const setRes = await redisCmd('set', redisKey, '1', 'NX');
       trace.redisMs = (performance.now() - tRedisStart).toFixed(1);
 
-      // 拦截重复文件
       if (setRes.ok && setRes.result !== 'OK') {
         try {
           if (settings.backupEnabled && ADMIN_USER_ID) {
@@ -469,8 +496,8 @@ export default async function handler(req, res) {
           }
         } finally {
           const tDelStart = performance.now();
-          await telegramFetch(`${TELEGRAM_API}/deleteMessage`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: currentChatId, message_id: messageId }) });
-          trace.deleteMs = (performance.now() - tDelStart).toFixed(1);
+          const delRes = await telegramFetch(`${TELEGRAM_API}/deleteMessage`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: currentChatId, message_id: messageId }) });
+          trace.deleteMs = delRes.networkMs || (performance.now() - tDelStart).toFixed(1);
         }
         
         printTraceLog(trace, reqStartMs);
@@ -478,19 +505,18 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2.4 全新文件 copyMessage 复制去头流程
+    // 2.2 全新文件 copyMessage 复制去头流程
     const tCopyStart = performance.now();
     const copyProcess = await copyMessageWithRetry(currentChatId, currentChatId, messageId, trace);
     trace.copyTotalMs = (performance.now() - tCopyStart).toFixed(1);
 
     if (copyProcess.success) {
-      const tDeleteStart = performance.now();
-      await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+      const delRes = await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
         body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
       });
-      trace.deleteMs = (performance.now() - tDeleteStart).toFixed(1);
+      trace.deleteMs = delRes.networkMs || 0;
     }
 
     printTraceLog(trace, reqStartMs);
