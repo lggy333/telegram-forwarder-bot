@@ -23,7 +23,7 @@ function enqueueTask(taskFn) {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------
-// Telegram API 请求封装 (静音且高敏捷)
+// Telegram API 请求封装
 // ---------------------------------------------------------
 async function telegramFetch(url, options, timeoutMs = 5000) {
   const controller = new AbortController();
@@ -76,7 +76,7 @@ let cachedSettings = null;
 let cachedSettingsTime = 0;
 async function getBotSettingsCached() {
   const now = Date.now();
-  if (cachedSettings && (now - cachedSettingsTime < 60000)) return cachedSettings; // 60s 缓存
+  if (cachedSettings && (now - cachedSettingsTime < 60000)) return cachedSettings;
   
   const dedupRes = await redisCmd('get', 'config:dedup_enabled');
   const backupRes = await redisCmd('get', 'config:backup_enabled');
@@ -100,25 +100,39 @@ function getMessageLink(chatId, messageId) {
 }
 
 // ---------------------------------------------------------
-// 精简版重复文件备份 (Forward + 独立通知卡片)
+// 严格串行执行的重复文件备份 (Forward -> Copy兜底 -> 发卡片)
 // ---------------------------------------------------------
 async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
   if (!ADMIN_USER_ID) return;
 
   const msgLink = getMessageLink(fromChatId, messageId);
 
-  // 1. 发起 Forward
+  // 步骤 1: 尝试 Forward 转发
+  let backupSuccess = false;
   const fwdRes = await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
   });
 
-  const isRestricted = !fwdRes.ok || !fwdRes.data?.ok;
-  const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
-  const statusNotice = isRestricted ? '\n⚠️ *(频道禁止转发，未能拉取源文件)*' : '';
+  if (fwdRes.ok && fwdRes.data?.ok) {
+    backupSuccess = true;
+  } else {
+    // 步骤 2: Forward 失败（如频道开启受保护内容禁止转发），降级使用 copyMessage 兜底备份
+    const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
+    });
+    if (copyRes.ok && copyRes.data?.ok) {
+      backupSuccess = true;
+    }
+  }
 
-  // 2. 发送简洁直观的通知卡片
+  const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
+  const statusNotice = !backupSuccess ? '\n⚠️ *(备份失败：可能源消息权限不足)*' : '';
+
+  // 步骤 3: 发送卡片通知
   await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -134,7 +148,7 @@ async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
 }
 
 // ---------------------------------------------------------
-// 队列驱动 + 熔断 + maxRetries=2 次重试
+// 队列驱动 + 熔断 + maxRetries=2 次重试 (针对正常非重复消息)
 // ---------------------------------------------------------
 async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetries = 2) {
   return enqueueTask(async () => {
@@ -164,6 +178,21 @@ async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetrie
     }
     return { success: false };
   });
+}
+
+// ---------------------------------------------------------
+// 删除消息与失败异常监控
+// ---------------------------------------------------------
+async function safeDeleteMessage(chatId, messageId) {
+  const delRes = await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+  });
+
+  if (!delRes.ok) {
+    console.error(`❌ [Delete Failed] chat_id: ${chatId} | message_id: ${messageId} | Status: ${delRes.httpStatus || 'Network Error'}`);
+  }
 }
 
 // ---------------------------------------------------------
@@ -224,39 +253,35 @@ export default async function handler(req, res) {
 
     const settings = await getBotSettingsCached();
 
-    // 1. Redis 去重与清理
+    // ---------------------------------------------------------
+    // 分支 1: Redis 去重拦截
+    // ---------------------------------------------------------
     if (uniqueId && settings.dedupEnabled) {
       const redisKey = `file:${currentChatId}:${uniqueId}`;
       const setRes = await redisCmd('set', redisKey, '1', 'NX');
 
       if (setRes.ok && setRes.result !== 'OK') {
-        // 备份 notification
+        // 1.1 严格 await 串行完成备份（Forward -> Copy 兜底 -> Send Notice）
         if (settings.backupEnabled && ADMIN_USER_ID) {
-          processDuplicateBackup(chatTitle, currentChatId, messageId, {
+          await processDuplicateBackup(chatTitle, currentChatId, messageId, {
             mediaType, fileName, fileSizeFormatted
-          }).catch(() => {});
+          }).catch(err => console.error('Backup Task Error:', err));
         }
 
-        // 异步静默删除
-        telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-          method: 'POST', 
-          headers: JSON_HEADERS, 
-          body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
-        }).catch(() => {});
+        // 1.2 确认备份完全结束后，最后执行异步删除
+        await safeDeleteMessage(currentChatId, messageId);
 
         return res.status(200).send('OK');
       }
     }
 
-    // 2. 复制无头消息并删除原消息
+    // ---------------------------------------------------------
+    // 分支 2: 正常新消息（复制无头卡片并删除原消息）
+    // ---------------------------------------------------------
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
-      telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: currentChatId, message_id: messageId })
-      }).catch(() => {});
+      await safeDeleteMessage(currentChatId, messageId);
     }
 
     return res.status(200).send('OK');
