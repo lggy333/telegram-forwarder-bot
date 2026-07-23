@@ -1,5 +1,5 @@
 // =========================================================================
-// Telegram Webhook 文件重复检测与备份核心逻辑 (V6 稳定测试版)
+// Telegram Webhook 文件重复检测与管理系统备份核心逻辑 (V6 稳定版)
 // =========================================================================
 
 async function handleTelegramWebhook(req, res) {
@@ -7,6 +7,7 @@ async function handleTelegramWebhook(req, res) {
         const update = req.body;
         const message = update?.message || update?.channel_post;
 
+        // 非消息事件直接放行
         if (!message) {
             return res.status(200).send("OK");
         }
@@ -15,18 +16,18 @@ async function handleTelegramWebhook(req, res) {
         const messageId = message.message_id;
         const chatTitle = message.chat.title || message.chat.first_name || "未知频道";
 
-        // 提取文件唯一 ID 及元数据 (假设包含 document, video, photo 等)
+        // 提取文件唯一 ID 及元数据 (必须包含 uniqueId, mediaType, fileName, fileSizeFormatted)
         const mediaData = extractMediaData(message);
         if (!mediaData) {
-            return res.status(200).send("OK"); // 非媒体消息，忽略
+            return res.status(200).send("OK"); // 非文件/媒体消息，忽略
         }
 
         const { uniqueId, mediaType, fileName, fileSizeFormatted } = mediaData;
         const redisKey = `file:${uniqueId}`;
 
-        // -----------------------------------------------------------------
-        // [修改一 & 修改二] 查询 Redis 记录，处理 pending 锁与 JSON 解析
-        // -----------------------------------------------------------------
+        // =================================================================
+        // 核心修改 1 & 2: Redis 查询、pending 状态拦截与统一 JSON 解析
+        // =================================================================
         const recordRes = await redisCmd("get", redisKey);
 
         if (!recordRes.ok) {
@@ -42,21 +43,20 @@ async function handleTelegramWebhook(req, res) {
                 console.error("❌ 解析 Redis 记录失败:", e);
             }
 
-            // 1. 如果还在处理中（pending），说明已有 Webhook 抢到锁，直接清理当前重复消息
+            // 1. 如果正在处理中 (pending)，说明另一个 Webhook 线程已抢到锁
             if (parsed.status === "pending") {
-                console.log("⏳ 文件正在处理中，清理当前重复消息");
+                console.log("⏳ 文件正在处理中，静默清理当前重复消息");
                 await safeDeleteMessage(currentChatId, messageId);
                 return res.status(200).send("OK");
             }
 
-            // 2. 复用 parsed 结构获取原始消息 ID
+            // 2. 避免重复解析，直接提取 origin_message_id
             const originMsgId = parsed.origin_message_id;
-
-            // -------------------------------------------------------------
-            // [修改三] 探针检测：判断原消息是否还在，并在成功后清理探针消息
-            // -------------------------------------------------------------
             let isTargetStillAlive = false;
 
+            // =============================================================
+            // 核心修改 3: 探针检测与清理 (成功后立即删除探针产生的管理员副本)
+            // =============================================================
             if (originMsgId) {
                 const verify = await telegramFetch(
                     `${TELEGRAM_API}/copyMessage`,
@@ -74,7 +74,7 @@ async function handleTelegramWebhook(req, res) {
                 if (verify.ok && verify.data?.ok) {
                     isTargetStillAlive = true;
 
-                    // 清理探针产生的临时消息，避免管理员收到垃圾消息
+                    // 探针验证成功，立即删掉发给管理员的这封探针消息，避免垃圾留存
                     await telegramFetch(
                         `${TELEGRAM_API}/deleteMessage`,
                         {
@@ -89,13 +89,13 @@ async function handleTelegramWebhook(req, res) {
                 }
             }
 
-            // -------------------------------------------------------------
-            // [修改四 & 修改五] 命中存活原消息，严格同步备份后再删频道重复消息
-            // -------------------------------------------------------------
+            // =============================================================
+            // 核心修改 4 & 5: 强制 await 管理系统备份，彻底消灭竞态条件
+            // =============================================================
             if (isTargetStillAlive) {
-                console.log(`♻️ 检测到存活的重复文件 [${uniqueId}]，开始备份并清理当前重复消息`);
+                console.log(`♻️ 检测到存活的原消息 [${originMsgId}]，开始管理系统备份并清理重复消息`);
 
-                // 必须 await，彻底消除竞态条件
+                // 强制同步等待 processDuplicateBackup 执行完成，绝不无 await 在后台跑
                 await processDuplicateBackup(
                     chatTitle,
                     currentChatId,
@@ -108,45 +108,62 @@ async function handleTelegramWebhook(req, res) {
                     }
                 );
 
-                // 备份完成后，再安全删除频道内的重复消息
+                // 确保管理员接收/管理系统日志落地完毕后，再删频道里的重复消息
                 await safeDeleteMessage(currentChatId, messageId);
 
                 return res.status(200).send("OK");
             }
 
-            // 如果原消息已被删除 (isTargetStillAlive === false)，则继续向下走，重新抢锁并当作新文件处理
-            console.log(`⚠️ 原消息 [${originMsgId}] 已不存在，准备重置记录并当作新文件处理`);
+            // 原消息已失效/被删，清空/覆盖无效记录，继续向下当新文件处理
+            console.log(`⚠️ 原始消息 [${originMsgId}] 已不在 Telegram，当作新文件重新建立记录`);
         }
 
-        // -----------------------------------------------------------------
+        // =================================================================
         // 新文件处理流程：抢占 pending 锁
-        // -----------------------------------------------------------------
-        const setLock = await redisCmd("set", redisKey, JSON.stringify({ status: "pending" }), "NX", "EX", "60");
-        
+        // =================================================================
+        const setLock = await redisCmd(
+            "set",
+            redisKey,
+            JSON.stringify({ status: "pending" }),
+            "NX",
+            "EX",
+            "60"
+        );
+
         if (!setLock.ok || setLock.result !== "OK") {
-            // 并发下抢锁失败，同样当作重复消息清理
+            // 并发下未抢到锁，说明有其他请求先一步进入，直接当作重复消息清理
             console.log("⏳ 并发抢锁失败，清理当前重复消息");
             await safeDeleteMessage(currentChatId, messageId);
             return res.status(200).send("OK");
         }
 
-        // [修改六] 设置 skip 锁防重标志，过期时间调整为 30 秒
-        await redisCmd("set", `skip:${uniqueId}`, "1", "EX", "30");
+        // =================================================================
+        // 核心修改 6: 防重 skip 锁超时时长延长至 30 秒，适应大文件传输
+        // =================================================================
+        await redisCmd(
+            "set",
+            `skip:${uniqueId}`,
+            "1",
+            "EX",
+            "30"
+        );
 
         // -----------------------------------------------------------------
-        // 执行常规新消息备份/转发逻辑...
+        // 此处接你原有的管理系统“新文件处理/转发/写入 Redis”完整逻辑...
         // -----------------------------------------------------------------
-        // 示例：更新 Redis 真实数据
-        // await redisCmd("set", redisKey, JSON.stringify({
-        //     origin_chat_id: currentChatId,
-        //     origin_message_id: messageId,
-        //     status: "completed"
-        // }));
+        /* Example:
+        await processNewFileBackup(...);
+        await redisCmd("set", redisKey, JSON.stringify({
+            origin_chat_id: currentChatId,
+            origin_message_id: messageId,
+            status: "completed"
+        }));
+        */
 
         return res.status(200).send("OK");
 
     } catch (err) {
-        console.error("❌ Webhook 处理严重异常:", err);
+        console.error("❌ Webhook 核心逻辑异常:", err);
         return res.status(200).send("OK");
     }
 }
