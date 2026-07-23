@@ -55,7 +55,7 @@ async function telegramFetch(url, options, timeoutMs = 7000) {
 }
 
 // ---------------------------------------------------------
-// 3. Redis 操作封装与配置缓存
+// 3. Redis 操作封装与健壮的 Key 清理逻辑
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -93,6 +93,51 @@ function clearSettingsCache() {
   cachedSettings = null;
 }
 
+// 可靠的删除记录实现（解决 Upstash REST KEYS 返回空数组的坑）
+async function clearChannelKeys(channelId) {
+  const pattern = channelId ? `file:${channelId}:*` : `file:*`;
+  let keysToDelete = [];
+
+  // 1. 尝试通过 KEYS 找 key
+  const keysRes = await redisCmd('keys', pattern);
+  if (keysRes.ok && Array.isArray(keysRes.result)) {
+    keysToDelete = keysRes.result;
+  }
+
+  // 2. 如果 KEYS 查出来为空，使用 SCAN 进行兜底查找
+  if (keysToDelete.length === 0) {
+    let cursor = '0';
+    do {
+      const scanRes = await redisCmd('scan', cursor, 'MATCH', pattern, 'COUNT', '100');
+      if (scanRes.ok && Array.isArray(scanRes.result)) {
+        cursor = scanRes.result[0];
+        const found = scanRes.result[1] || [];
+        keysToDelete.push(...found);
+      } else {
+        break;
+      }
+    } while (cursor !== '0');
+  }
+
+  if (keysToDelete.length === 0) {
+    return { ok: true, count: 0 };
+  }
+
+  // 批量删除找到的 key
+  const pipelineBody = keysToDelete.map(k => ["DEL", k]);
+  try {
+    await fetch(`${UPSTASH_REST_URL}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_REST_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(pipelineBody)
+    });
+    console.log(`[Redis 清理] 匹配模式: ${pattern} | 成功清理 ${keysToDelete.length} 个 Key`);
+    return { ok: true, count: keysToDelete.length };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 // ---------------------------------------------------------
 // 4. 管理后台辅助工具函数
 // ---------------------------------------------------------
@@ -117,28 +162,6 @@ async function getChannelKeyCount(channelId) {
   const pattern = channelId ? `file:${channelId}:*` : `file:*`;
   const keysRes = await redisCmd('keys', pattern);
   return keysRes.ok && Array.isArray(keysRes.result) ? keysRes.result.length : 0;
-}
-
-async function clearChannelKeys(channelId) {
-  const pattern = channelId ? `file:${channelId}:*` : `file:*`;
-  const keysRes = await redisCmd('keys', pattern);
-  if (!keysRes.ok || !Array.isArray(keysRes.result) || keysRes.result.length === 0) {
-    return { ok: true, count: 0 };
-  }
-
-  const keys = keysRes.result;
-  const pipelineBody = keys.map(k => ["DEL", k]);
-  
-  try {
-    await fetch(`${UPSTASH_REST_URL}/pipeline`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${UPSTASH_REST_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineBody)
-    });
-    return { ok: true, count: keys.length };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
 }
 
 async function buildMainMenu() {
@@ -176,54 +199,47 @@ function getMessageLink(chatId, messageId) {
   return `https://t.me/${strId.replace('@', '')}/${messageId}`;
 }
 
-async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
-  if (!ADMIN_USER_ID) return null;
+// **仅在发现重复文件时调用**：将重复文件复制备份给管理员，并发送卡片报告（附带有头无头消息链接）
+async function processDuplicateBackup(chatTitle, fromChatId, duplicateMsgId, originMsgId, meta) {
+  if (!ADMIN_USER_ID) return;
 
-  const msgLink = getMessageLink(fromChatId, messageId);
-  let adminMsgId = null;
+  // 使用真正的频道无头消息 ID 拼接链接
+  const targetMsgId = originMsgId || duplicateMsgId;
+  const msgLink = getMessageLink(fromChatId, targetMsgId);
+  
   let backupSuccess = false;
+  let copyErrorDetail = '';
 
-  // 1. 优先尝试转发消息
-  const fwdRes = await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
+  // 1. 尝试将重复的消息复制给管理员备份
+  const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
+    body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: duplicateMsgId })
   });
 
-  if (fwdRes.ok && fwdRes.data?.ok) {
+  if (copyRes.ok && copyRes.data?.ok) {
     backupSuccess = true;
-    adminMsgId = fwdRes.data.result.message_id;
   } else {
-    // 2. 降级尝试复制消息
-    const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
-    });
-    if (copyRes.ok && copyRes.data?.ok) {
-      backupSuccess = true;
-      adminMsgId = copyRes.data.result.message_id;
-    }
+    copyErrorDetail = copyRes.data?.description || `HTTP ${copyRes.httpStatus || '请求失败'}`;
+    console.error(`❌ [管理员备份失败] MessageID: ${duplicateMsgId} | 原因:`, copyRes);
   }
 
   const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
-  const statusNotice = !backupSuccess ? '\n⚠️ *(备份失败：源消息权限受限)*' : '';
+  const statusNotice = !backupSuccess ? `\n⚠️ *(备份失败原因：${copyErrorDetail})*` : '';
 
-  // 3. 向管理员私发去重卡片报告
+  // 2. 向管理员发送去重卡片报告
   await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
       chat_id: ADMIN_USER_ID,
-      text: `⚠️ **检测到重复文件**\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **消息ID：** \`${messageId}\`${statusNotice}`,
+      text: `⚠️ **检测到重复文件**\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **重复消息ID：** \`${duplicateMsgId}\`${statusNotice}`,
       parse_mode: 'Markdown',
       reply_markup: {
-        inline_keyboard: [[{ text: `🔗 原消息 (#${messageId})`, url: msgLink }]]
+        inline_keyboard: [[{ text: `🔗 查看频道无头消息 (#${targetMsgId})`, url: msgLink }]]
       }
     })
   });
-
-  return adminMsgId;
 }
 
 async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetries = 2) {
@@ -511,7 +527,7 @@ export default async function handler(req, res) {
 
     const messageId = message.message_id;
 
-    // 【关键防护】过滤机器人自己生成的无头消息二次进入循环
+    // 【防二次入队】拦截机器人自己生成的无头消息，防止逻辑自环
     const skipCheck = await redisCmd('get', `skip:${messageId}`);
     if (skipCheck.ok && skipCheck.result) {
       return res.status(200).send('OK');
@@ -559,7 +575,7 @@ export default async function handler(req, res) {
     const settings = await getBotSettingsCached();
 
     // ---------------------------------------------------------
-    // 分支 3.1: Redis 查重拦截 (检测到已有记录)
+    // 分支 3.1: Redis 查重拦截 (仅在确认【已重复】时触发备份和管理员报告)
     // ---------------------------------------------------------
     if (uniqueId && settings.dedupEnabled) {
       const redisKey = `file:${currentChatId}:${uniqueId}`;
@@ -571,41 +587,49 @@ export default async function handler(req, res) {
       }
 
       if (recordRes.result !== null) {
-        // 发现重复！如果开启了备份，私发给管理员
-        if (settings.backupEnabled && ADMIN_USER_ID) {
-          processDuplicateBackup(chatTitle, currentChatId, messageId, {
-            mediaType, fileName, fileSizeFormatted
-          }).catch(() => {});
+        // 解析历史记录里保存的频道无头消息 ID
+        let originMsgId = null;
+        try {
+          const parsed = JSON.parse(recordRes.result);
+          originMsgId = parsed.origin_message_id;
+        } catch (e) {
+          originMsgId = null; // 兼容旧数据格式
         }
 
-        // 静默删除频道内的重复消息
+        // 仅在发现重复时，给管理员发送私发备份与报告
+        if (settings.backupEnabled && ADMIN_USER_ID) {
+          processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
+            mediaType, fileName, fileSizeFormatted
+          }).catch(err => console.error('备份处理异常:', err));
+        }
+
+        // 静默删除频道内的重复消息，频道零提示
         await safeDeleteMessage(currentChatId, messageId);
         return res.status(200).send('OK');
       }
     }
 
     // ---------------------------------------------------------
-    // 分支 3.2: 正常新文件处理 (复制无头消息 -> 写入 Redis -> 标 Skip -> 删原件)
+    // 分支 3.2: 正常新文件流程 (复制无头件 -> 存 Redis 无头ID -> 标 Skip -> 删原件)
     // ---------------------------------------------------------
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
-      // 1. 设置 skip 缓存（60秒），防止复制出的新消息引发二次 Webhook 误判
+      // 1. 设置 60 秒 skip 标记，防止此无头消息触发 Webhook 自环
       await redisCmd('set', `skip:${copyProcess.messageId}`, '1', 'EX', '60');
 
-      // 2. 写入数据库记忆
+      // 2. 写入数据库，存入真正保留在频道的【无头消息 ID】
       if (uniqueId && settings.dedupEnabled) {
         const redisKey = `file:${currentChatId}:${uniqueId}`;
         const originPayload = JSON.stringify({
           origin_chat_id: currentChatId,
-          origin_message_id: copyProcess.messageId,
-          backup_message_id: null
+          origin_message_id: copyProcess.messageId
         });
 
         await redisCmd('set', redisKey, originPayload);
       }
 
-      // 3. 删除用户/管理员发送的带头原始消息，频道仅保留无头消息
+      // 3. 删除带头的原始消息
       await safeDeleteMessage(currentChatId, messageId);
     }
 
