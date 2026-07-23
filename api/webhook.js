@@ -55,7 +55,7 @@ async function telegramFetch(url, options, timeoutMs = 7000) {
 }
 
 // ---------------------------------------------------------
-// 3. Redis 操作封装（全面支持 Upstash REST API 复杂指令）
+// 3. Redis 操作封装
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -93,7 +93,6 @@ function clearSettingsCache() {
   cachedSettings = null;
 }
 
-// 可靠的删除记录实现（支持 SCAN 增量兜底遍历）
 async function clearChannelKeys(channelId) {
   const pattern = channelId ? `file:${channelId}:*` : `file:*`;
   let keysToDelete = [];
@@ -163,7 +162,7 @@ async function getChannelKeyCount(channelId) {
 
 async function buildMainMenu() {
   const settings = await getBotSettingsCached();
-  const text = `🤖 **控制面板 (V5 稳定版)**\n\n` +
+  const text = `🤖 **控制面板 (V5.1 稳定精简版)**\n\n` +
                `点击下方按钮进行去重与备份控制：`;
 
   const keyboard = {
@@ -186,7 +185,7 @@ async function buildMainMenu() {
 }
 
 // ---------------------------------------------------------
-// 5. 核心逻辑工具函数（含备份通知与智能复制）
+// 5. 核心逻辑工具函数
 // ---------------------------------------------------------
 function getMessageLink(chatId, messageId) {
   const strId = String(chatId);
@@ -513,10 +512,19 @@ export default async function handler(req, res) {
     }
 
     // =========================================================
-    // 路由 3：核心频道转发去重逻辑 (V5 彻底解决竞争与死锁)
+    // 路由 3：核心频道转发去重逻辑
     // =========================================================
     if (!ALLOWED_CHANNELS.includes(currentChatId)) return res.status(200).send('OK');
     if (message.author_signature === 'Bot' || message.from?.is_bot) return res.status(200).send('OK');
+
+    const messageId = message.message_id;
+
+    // 🎯 精准防自环：判断当前消息是否为机器人刚才 copy 出来的无头消息
+    const skipCheck = await redisCmd('get', `skip_msg:${messageId}`);
+    if (skipCheck.ok && skipCheck.result) {
+      await redisCmd('del', `skip_msg:${messageId}`); // 顺便清理掉此临时 tag
+      return res.status(200).send('OK');
+    }
 
     const video = message.video;
     const photo = message.photo;
@@ -526,7 +534,6 @@ export default async function handler(req, res) {
     if (!video && !photo && !animation && !document) return res.status(200).send('OK');
 
     const chatTitle = message.chat.title || currentChatId;
-    const messageId = message.message_id;
     
     let uniqueId = null;
     let rawSizeBytes = 0;
@@ -556,12 +563,6 @@ export default async function handler(req, res) {
 
     if (!uniqueId) return res.status(200).send('OK');
 
-    // 【修复 Bug 4】: 基于 file_unique_id 防自环，防 copyMessage 生成的新无头消息引发 Webhook 死循环
-    const skipCheck = await redisCmd('get', `skip:${uniqueId}`);
-    if (skipCheck.ok && skipCheck.result) {
-      return res.status(200).send('OK');
-    }
-
     const fileSizeFormatted = rawSizeBytes > 0 
       ? (rawSizeBytes > 1048576 ? `${(rawSizeBytes / 1048576).toFixed(2)} MB` : `${(rawSizeBytes / 1024).toFixed(1)} KB`)
       : 'Unknown';
@@ -579,7 +580,7 @@ export default async function handler(req, res) {
       }
 
       // -------------------------------------------------------
-      // 情况 A：Redis 查到记录，进行【物理存活探针校验】（修复 Bug 3）
+      // 情况 A：Redis 查到记录，进行【物理存活探针校验】
       // -------------------------------------------------------
       if (recordRes.result !== null) {
         let originMsgId = null;
@@ -610,7 +611,7 @@ export default async function handler(req, res) {
         }
 
         if (isTargetStillAlive) {
-          // 确定为真重复文件：静默删掉频道重复消息，给管理员推送报告
+          // 确定为重复文件：静默删掉重复消息，推送管理报告
           if (settings.backupEnabled && ADMIN_USER_ID) {
             processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
               mediaType, fileName, fileSizeFormatted
@@ -620,14 +621,14 @@ export default async function handler(req, res) {
           await safeDeleteMessage(currentChatId, messageId);
           return res.status(200).send('OK');
         } else {
-          // 频道里的原无头消息已被删除！清除过期 Redis 缓存，自动降级为【全新文件】处理
+          // 频道里的原无头消息已被删除，清除过期缓存，当新文件重新处理
           console.warn(`🗑️ 原无头消息 #${originMsgId} 在频道已不存在，清除脏数据并当作新文件重新处理。`);
           await redisCmd('del', redisKey);
         }
       }
 
       // -------------------------------------------------------
-      // 情况 B：新文件流程（抢占原子锁 SET NX）（修复 Bug 1 & Bug 2）
+      // 情况 B：新文件流程（抢占原子锁 SET NX）
       // -------------------------------------------------------
       const lockPayload = JSON.stringify({
         status: 'pending',
@@ -638,21 +639,21 @@ export default async function handler(req, res) {
       const lockRes = await redisCmd('set', redisKey, lockPayload, 'NX', 'EX', '600');
 
       if (!lockRes.ok || lockRes.result !== 'OK') {
-        // 抢锁失败，说明并发请求正在创建该文件无头消息，直接删除本次并发消息
+        // 抢锁失败，说明并发请求正在处理该文件，直接删掉重复消息
         await safeDeleteMessage(currentChatId, messageId);
         return res.status(200).send('OK');
       }
     }
 
     // ---------------------------------------------------------
-    // 步骤 2：生成无头消息，并保存真实 message_id
+    // 步骤 2：生成无头消息，保存真实 message_id
     // ---------------------------------------------------------
-    // 打上 10 秒 TTL 的 skip 标记（基于 unique_id），阻断随后由 copyMessage 产生的 Webhook 触发
-    await redisCmd('set', `skip:${uniqueId}`, '1', 'EX', '10');
-
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
+      // 🎯 在 Redis 标记生成的“无头消息 ID”，使得该无头消息再触发 Webhook 时被第一时间的 skipCheck 精准拦截并放行
+      await redisCmd('set', `skip_msg:${copyProcess.messageId}`, '1', 'EX', '30');
+
       // 保存正式的频道无头消息 ID
       if (settings.dedupEnabled) {
         const finalPayload = JSON.stringify({
@@ -662,7 +663,7 @@ export default async function handler(req, res) {
         await redisCmd('set', redisKey, finalPayload);
       }
 
-      // 删掉带头原消息
+      // 删掉带发送人的原消息
       await safeDeleteMessage(currentChatId, messageId);
     } else {
       // 复制无头消息失败，释放抢占的锁，防止留下无用垃圾数据
