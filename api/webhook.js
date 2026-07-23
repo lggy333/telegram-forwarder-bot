@@ -20,6 +20,14 @@ function enqueueTask(taskFn) {
   return result;
 }
 
+let duplicateReportQueue = Promise.resolve();
+
+function enqueueDuplicate(taskFn) {
+  const result = duplicateReportQueue.then(() => taskFn());
+  duplicateReportQueue = result.catch(() => {});
+  return result;
+}
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------
@@ -581,9 +589,9 @@ export default async function handler(req, res) {
       }
 
       // -------------------------------------------------------
-      // 情况 A：Redis 查到记录，进行【物理存活探针校验】
+      // 情况 A：确认已是历史重复文件 (排除 LOCK 状态)
       // -------------------------------------------------------
-      if (recordRes.result !== null) {
+      if (recordRes.result !== null && recordRes.result !== 'LOCK') {
         let originMsgId = null;
         try {
           const parsed = JSON.parse(recordRes.result);
@@ -592,52 +600,70 @@ export default async function handler(req, res) {
           originMsgId = null;
         }
 
-        let isTargetStillAlive = false;
+        // 优化顺序：先在频道中秒删重复消息（防残留），随后异步发送管理员报告
+        await safeDeleteMessage(currentChatId, messageId);
 
-        if (originMsgId && ADMIN_USER_ID) {
-          // 用一次探针 copyMessage 验证频道原消息是否仍存在
-          const verify = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
-            method: 'POST',
-            headers: JSON_HEADERS,
-            body: JSON.stringify({
-              chat_id: ADMIN_USER_ID,
-              from_chat_id: currentChatId,
-              message_id: originMsgId
-            })
-          });
-
-          if (verify.ok && verify.data?.ok) {
-            isTargetStillAlive = true;
-          }
+        if (settings.backupEnabled && ADMIN_USER_ID) {
+          await enqueueDuplicate(() => processDuplicateBackup(
+            chatTitle, 
+            currentChatId, 
+            messageId, 
+            originMsgId, 
+            { mediaType, fileName, fileSizeFormatted }
+          )).catch(err => console.error('备份报告队列出错:', err));
         }
 
-        if (isTargetStillAlive) {
-          // 确定为重复文件：删除重复消息，推送管理报告
-          if (settings.backupEnabled && ADMIN_USER_ID) {
-            processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
-              mediaType, fileName, fileSizeFormatted
-            }).catch(err => console.error('备份报告发送失败:', err));
-          }
-
-          await safeDeleteMessage(currentChatId, messageId);
-          return res.status(200).send('OK');
-        } else {
-          // 频道里的原消息已被删除，清除过期缓存，当新文件重新处理
-          console.warn(`🗑️ 原消息 #${originMsgId} 已不存在，清除记录并按新文件处理。`);
-          await redisCmd('del', redisKey);
-        }
+        return res.status(200).send('OK');
       }
 
       // -------------------------------------------------------
-      // 情况 B：新文件流程（抢占原子锁 SET NX）
+      // 情况 B：新文件流程（抢占原子锁 SET NX，超时设为 60 秒）
       // -------------------------------------------------------
-      // 尝试用 SET NX 抢占唯一写锁（简化的 "LOCK" 占位，有效期 600 秒防死锁）
-      const lockRes = await redisCmd('set', redisKey, 'LOCK', 'NX', 'EX', '600');
+      const lockRes = await redisCmd('set', redisKey, 'LOCK', 'NX', 'EX', '60');
 
       if (!lockRes.ok || lockRes.result !== 'OK') {
-        // 抢锁失败，说明并发请求正在处理该文件，直接删掉重复消息
-        await safeDeleteMessage(currentChatId, messageId);
-        return res.status(200).send('OK');
+        // 抢锁失败：说明另一个 Webhook 实例正在处理同一文件
+        console.log(`⏳ 文件正在处理中，退让等待确认: ${uniqueId}`);
+        await sleep(3000);
+
+        // 退让 3 秒后回查 Redis 状态
+        const retryCheck = await redisCmd('get', redisKey);
+        
+        // 分支 B1：先行的实例处理成功（写入了真正的 JSON 记录）
+        if (retryCheck.ok && retryCheck.result && retryCheck.result !== 'LOCK') {
+          let originMsgId = null;
+          try {
+            originMsgId = JSON.parse(retryCheck.result).origin_message_id;
+          } catch (e) {}
+
+          await safeDeleteMessage(currentChatId, messageId);
+
+          if (settings.backupEnabled && ADMIN_USER_ID) {
+            await enqueueDuplicate(() => processDuplicateBackup(
+              chatTitle, 
+              currentChatId, 
+              messageId, 
+              originMsgId, 
+              { mediaType, fileName, fileSizeFormatted }
+            )).catch(err => console.error('备份报告队列出错:', err));
+          }
+
+          return res.status(200).send('OK');
+        } 
+        // 分支 B2：先行的实例处理失败（锁已释放/被删），尝试重新抢锁并接管转发
+        else if (retryCheck.ok && !retryCheck.result) {
+          const retryLock = await redisCmd('set', redisKey, 'LOCK', 'NX', 'EX', '60');
+          if (!retryLock.ok || retryLock.result !== 'OK') {
+            await safeDeleteMessage(currentChatId, messageId);
+            return res.status(200).send('OK');
+          }
+          // 重新抢锁成功，代码顺延往下继续执行 copyMessage...
+        } 
+        // 分支 B3：先行实例卡死/仍在 LOCK 状态，兜底直接安全删除，防频道垃圾残留
+        else {
+          await safeDeleteMessage(currentChatId, messageId);
+          return res.status(200).send('OK');
+        }
       }
     }
 
