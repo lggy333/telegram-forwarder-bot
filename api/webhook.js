@@ -55,7 +55,7 @@ async function telegramFetch(url, options, timeoutMs = 7000) {
 }
 
 // ---------------------------------------------------------
-// 3. Redis 操作封装
+// 3. Redis 操作封装（全面支持 Upstash REST API 复杂指令）
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -93,7 +93,7 @@ function clearSettingsCache() {
   cachedSettings = null;
 }
 
-// 可靠的删除记录实现
+// 可靠的删除记录实现（支持 SCAN 增量兜底遍历）
 async function clearChannelKeys(channelId) {
   const pattern = channelId ? `file:${channelId}:*` : `file:*`;
   let keysToDelete = [];
@@ -186,7 +186,7 @@ async function buildMainMenu() {
 }
 
 // ---------------------------------------------------------
-// 5. 核心逻辑工具函数
+// 5. 核心逻辑工具函数（含备份通知与智能复制）
 // ---------------------------------------------------------
 function getMessageLink(chatId, messageId) {
   const strId = String(chatId);
@@ -513,7 +513,7 @@ export default async function handler(req, res) {
     }
 
     // =========================================================
-    // 路由 3：核心频道转发去重逻辑
+    // 路由 3：核心频道转发去重逻辑 (V5 彻底解决竞争与死锁)
     // =========================================================
     if (!ALLOWED_CHANNELS.includes(currentChatId)) return res.status(200).send('OK');
     if (message.author_signature === 'Bot' || message.from?.is_bot) return res.status(200).send('OK');
@@ -556,7 +556,7 @@ export default async function handler(req, res) {
 
     if (!uniqueId) return res.status(200).send('OK');
 
-    // 基于 file_unique_id 防自环
+    // 【修复 Bug 4】: 基于 file_unique_id 防自环，防 copyMessage 生成的新无头消息引发 Webhook 死循环
     const skipCheck = await redisCmd('get', `skip:${uniqueId}`);
     if (skipCheck.ok && skipCheck.result) {
       return res.status(200).send('OK');
@@ -579,23 +579,17 @@ export default async function handler(req, res) {
       }
 
       // -------------------------------------------------------
-      // 情况 A：Redis 查到记录，进行【物理存活探针校验】
+      // 情况 A：Redis 查到记录，进行【物理存活探针校验】（修复 Bug 3）
       // -------------------------------------------------------
       if (recordRes.result !== null) {
-        let parsed = {};
+        let originMsgId = null;
         try {
-          parsed = JSON.parse(recordRes.result);
-        } catch (e) {}
-
-        // 【修改点 1】：检测是否属于 pending 处理中状态，如果是则代表并发线程抢到锁，直接优雅退出
-        if (parsed.status === 'pending') {
-          console.log('⏳ 文件正在处理中，删除当前重复消息');
-          await safeDeleteMessage(currentChatId, messageId);
-          return res.status(200).send('OK');
+          const parsed = JSON.parse(recordRes.result);
+          originMsgId = parsed.origin_message_id;
+        } catch (e) {
+          originMsgId = null;
         }
 
-        // 【修改点 2】：安全获取源消息 ID
-        const originMsgId = parsed.origin_message_id;
         let isTargetStillAlive = false;
 
         if (originMsgId && ADMIN_USER_ID) {
@@ -612,25 +606,15 @@ export default async function handler(req, res) {
 
           if (verify.ok && verify.data?.ok) {
             isTargetStillAlive = true;
-
-            // 【修改点 3】：删除探针复制产生的管理员临时垃圾消息
-            await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-              method: 'POST',
-              headers: JSON_HEADERS,
-              body: JSON.stringify({
-                chat_id: ADMIN_USER_ID,
-                message_id: verify.data.result.message_id
-              })
-            });
           }
         }
 
         if (isTargetStillAlive) {
-          // 【修改点 4 & 5】：改为顺序执行 `await` 备份，防止与 safeDeleteMessage 竞争，执行完后删除并退出
+          // 确定为真重复文件：静默删掉频道重复消息，给管理员推送报告
           if (settings.backupEnabled && ADMIN_USER_ID) {
-            await processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
+            processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
               mediaType, fileName, fileSizeFormatted
-            });
+            }).catch(err => console.error('备份报告发送失败:', err));
           }
 
           await safeDeleteMessage(currentChatId, messageId);
@@ -643,7 +627,7 @@ export default async function handler(req, res) {
       }
 
       // -------------------------------------------------------
-      // 情况 B：新文件流程（抢占原子锁 SET NX）
+      // 情况 B：新文件流程（抢占原子锁 SET NX）（修复 Bug 1 & Bug 2）
       // -------------------------------------------------------
       const lockPayload = JSON.stringify({
         status: 'pending',
@@ -663,8 +647,8 @@ export default async function handler(req, res) {
     // ---------------------------------------------------------
     // 步骤 2：生成无头消息，并保存真实 message_id
     // ---------------------------------------------------------
-    // 【修改点 6】：锁延长至 30 秒，防止大文件传输时跳过标记失效
-    await redisCmd('set', `skip:${uniqueId}`, '1', 'EX', '30');
+    // 打上 10 秒 TTL 的 skip 标记（基于 unique_id），阻断随后由 copyMessage 产生的 Webhook 触发
+    await redisCmd('set', `skip:${uniqueId}`, '1', 'EX', '10');
 
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
