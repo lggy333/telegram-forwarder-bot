@@ -162,7 +162,7 @@ async function getChannelKeyCount(channelId) {
 
 async function buildMainMenu() {
   const settings = await getBotSettingsCached();
-  const text = `🤖 **控制面板 (V5.1 稳定精简版)**\n\n` +
+  const text = `🤖 **机器人记忆控制面板**\n\n` +
                `点击下方按钮进行去重与备份控制：`;
 
   const keyboard = {
@@ -219,16 +219,17 @@ async function processDuplicateBackup(chatTitle, fromChatId, duplicateMsgId, ori
 
   const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
   const statusNotice = !backupSuccess ? `\n⚠️ *(备份副本失败: ${copyErrorDetail})*` : '';
+  const originMsgText = originMsgId ? `\n🆔 **原消息ID：** \`${originMsgId}\`` : '';
 
   await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
       chat_id: ADMIN_USER_ID,
-      text: `⚠️ **检测到重复文件并已清理**\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **重复消息ID：** \`${duplicateMsgId}\`${statusNotice}`,
+      text: `⚠️ **检测到重复文件**\n已自动删除重复消息\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **重复消息ID：** \`${duplicateMsgId}\`${originMsgText}${statusNotice}`,
       parse_mode: 'Markdown',
       reply_markup: {
-        inline_keyboard: [[{ text: `🔗 查看频道无头原消息 (#${targetMsgId})`, url: msgLink }]]
+        inline_keyboard: [[{ text: `🔗 查看原消息 (#${targetMsgId})`, url: msgLink }]]
       }
     })
   });
@@ -365,7 +366,7 @@ export default async function handler(req, res) {
         const chanId = action.replace('clean_chan_', '');
         const resClean = await clearChannelKeys(chanId);
         const msgText = resClean.ok 
-          ? `✅ **清理完成！**\n已成功抹除该频道 \`${resClean.count}\` 条文件记录。`
+          ? `✅ **清理完成！**\n已成功清除该频道 \`${resClean.count}\` 条文件记录。`
           : `❌ 清理失败：${resClean.error}`;
 
         await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
@@ -414,7 +415,7 @@ export default async function handler(req, res) {
             reply_markup: {
               inline_keyboard: [
                 [
-                  { text: "🔥 确认彻底清空", callback_data: "do_clean_all" },
+                  { text: "⚠️ 确认清空", callback_data: "do_clean_all" },
                   { text: "❌ 取消", callback_data: "menu_main" }
                 ]
               ]
@@ -445,7 +446,7 @@ export default async function handler(req, res) {
         const delay = Date.now() - startT;
         report += `💾 **Redis 数据库：** ${pingRes.ok ? `✅ 正常 (${delay}ms)` : `❌ 异常 (${pingRes.error})`}\n\n`;
 
-        report += `📢 **频道管理员权限检测：**\n`;
+        report += `📢 **频道权限检查：**\n`;
         const channels = await getChannelsInfo();
         const botId = BOT_TOKEN ? BOT_TOKEN.split(':')[0] : '';
         for (const c of channels) {
@@ -457,9 +458,9 @@ export default async function handler(req, res) {
 
           if (memberRes.ok && memberRes.data?.result?.status === 'administrator') {
             const adm = memberRes.data.result;
-            const canDelete = adm.can_delete_messages ? '✅' : '❌无删除权限';
-            const canPost = adm.can_post_messages ? '✅' : '❌无发帖权限';
-            report += `• **${c.title}**\n  - 发帖: ${canPost} | 删帖: ${canDelete}\n`;
+            const canDelete = adm.can_delete_messages ? '✅' : '❌无删除消息权限';
+            const canPost = adm.can_post_messages ? '✅' : '❌无发送消息权限';
+            report += `• **${c.title}**\n  - 发送消息: ${canPost} | 删除消息: ${canDelete}\n`;
           } else {
             report += `• **${c.title}**\n  - ❌ 机器人未获取到管理员身份\n`;
           }
@@ -519,10 +520,10 @@ export default async function handler(req, res) {
 
     const messageId = message.message_id;
 
-    // 🎯 精准防自环：判断当前消息是否为机器人刚才 copy 出来的无头消息
+    // 精准防自环：判断当前消息是否为机器人刚才复制出的新消息
     const skipCheck = await redisCmd('get', `skip_msg:${messageId}`);
     if (skipCheck.ok && skipCheck.result) {
-      await redisCmd('del', `skip_msg:${messageId}`); // 顺便清理掉此临时 tag
+      await redisCmd('del', `skip_msg:${messageId}`);
       return res.status(200).send('OK');
     }
 
@@ -575,7 +576,7 @@ export default async function handler(req, res) {
       const recordRes = await redisCmd('get', redisKey);
 
       if (!recordRes.ok) {
-        console.error('❌ Redis 查询异常，终止执行以保证安全性');
+        console.error('❌ Redis 查询失败，已停止处理当前消息。');
         return res.status(200).send('OK');
       }
 
@@ -594,7 +595,7 @@ export default async function handler(req, res) {
         let isTargetStillAlive = false;
 
         if (originMsgId && ADMIN_USER_ID) {
-          // 用一次探针 copyMessage 验证频道无头原消息是否仍存在
+          // 用一次探针 copyMessage 验证频道原消息是否仍存在
           const verify = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
             method: 'POST',
             headers: JSON_HEADERS,
@@ -611,7 +612,7 @@ export default async function handler(req, res) {
         }
 
         if (isTargetStillAlive) {
-          // 确定为重复文件：静默删掉重复消息，推送管理报告
+          // 确定为重复文件：删除重复消息，推送管理报告
           if (settings.backupEnabled && ADMIN_USER_ID) {
             processDuplicateBackup(chatTitle, currentChatId, messageId, originMsgId, {
               mediaType, fileName, fileSizeFormatted
@@ -621,8 +622,8 @@ export default async function handler(req, res) {
           await safeDeleteMessage(currentChatId, messageId);
           return res.status(200).send('OK');
         } else {
-          // 频道里的原无头消息已被删除，清除过期缓存，当新文件重新处理
-          console.warn(`🗑️ 原无头消息 #${originMsgId} 在频道已不存在，清除脏数据并当作新文件重新处理。`);
+          // 频道里的原消息已被删除，清除过期缓存，当新文件重新处理
+          console.warn(`🗑️ 原消息 #${originMsgId} 已不存在，清除记录并按新文件处理。`);
           await redisCmd('del', redisKey);
         }
       }
@@ -630,13 +631,8 @@ export default async function handler(req, res) {
       // -------------------------------------------------------
       // 情况 B：新文件流程（抢占原子锁 SET NX）
       // -------------------------------------------------------
-      const lockPayload = JSON.stringify({
-        status: 'pending',
-        timestamp: Date.now()
-      });
-
-      // 尝试用 SET NX 抢占唯一写锁（锁有效期 600 秒，防死锁）
-      const lockRes = await redisCmd('set', redisKey, lockPayload, 'NX', 'EX', '600');
+      // 尝试用 SET NX 抢占唯一写锁（简化的 "LOCK" 占位，有效期 600 秒防死锁）
+      const lockRes = await redisCmd('set', redisKey, 'LOCK', 'NX', 'EX', '600');
 
       if (!lockRes.ok || lockRes.result !== 'OK') {
         // 抢锁失败，说明并发请求正在处理该文件，直接删掉重复消息
@@ -651,10 +647,10 @@ export default async function handler(req, res) {
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
-      // 🎯 在 Redis 标记生成的“无头消息 ID”，使得该无头消息再触发 Webhook 时被第一时间的 skipCheck 精准拦截并放行
+      // 标记复制出的新消息 ID，防自环
       await redisCmd('set', `skip_msg:${copyProcess.messageId}`, '1', 'EX', '30');
 
-      // 保存正式的频道无头消息 ID
+      // 保存正式的频道原消息 ID
       if (settings.dedupEnabled) {
         const finalPayload = JSON.stringify({
           origin_chat_id: currentChatId,
@@ -663,10 +659,10 @@ export default async function handler(req, res) {
         await redisCmd('set', redisKey, finalPayload);
       }
 
-      // 删掉带发送人的原消息
+      // 删除带发送人头部的原消息
       await safeDeleteMessage(currentChatId, messageId);
     } else {
-      // 复制无头消息失败，释放抢占的锁，防止留下无用垃圾数据
+      // 复制失败，释放抢占的锁
       if (settings.dedupEnabled) {
         await redisCmd('del', redisKey);
       }
