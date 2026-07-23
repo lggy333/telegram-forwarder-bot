@@ -94,7 +94,7 @@ function clearSettingsCache() {
 }
 
 // ---------------------------------------------------------
-// 4. 管理后台辅助工具函数 (从最早版本移植)
+// 4. 管理后台辅助工具函数
 // ---------------------------------------------------------
 async function getChannelsInfo() {
   const list = [];
@@ -183,6 +183,7 @@ async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
   let adminMsgId = null;
   let backupSuccess = false;
 
+  // 1. 优先尝试转发消息
   const fwdRes = await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -193,6 +194,7 @@ async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
     backupSuccess = true;
     adminMsgId = fwdRes.data.result.message_id;
   } else {
+    // 2. 降级尝试复制消息
     const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
       method: 'POST',
       headers: JSON_HEADERS,
@@ -207,6 +209,7 @@ async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
   const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
   const statusNotice = !backupSuccess ? '\n⚠️ *(备份失败：源消息权限受限)*' : '';
 
+  // 3. 向管理员私发去重卡片报告
   await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -263,22 +266,8 @@ async function safeDeleteMessage(chatId, messageId) {
   });
 }
 
-async function sendDuplicateNotice(chatId, targetChatId, originMsgId) {
-  const originLink = getMessageLink(targetChatId, originMsgId);
-  await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ 
-      chat_id: chatId, 
-      text: `🔗 **发现重复文件**\n[点击跳转查看原消息](${originLink})`, 
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true
-    })
-  });
-}
-
 // ---------------------------------------------------------
-// 6. Webhook 主入口 (完整三大路由分发)
+// 6. Webhook 主入口
 // ---------------------------------------------------------
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -515,10 +504,18 @@ export default async function handler(req, res) {
     }
 
     // =========================================================
-    // 路由 3：核心频道转发去重逻辑 (原汁原味的优化版)
+    // 路由 3：核心频道转发去重逻辑
     // =========================================================
     if (!ALLOWED_CHANNELS.includes(currentChatId)) return res.status(200).send('OK');
     if (message.author_signature === 'Bot' || message.from?.is_bot) return res.status(200).send('OK');
+
+    const messageId = message.message_id;
+
+    // 【关键防护】过滤机器人自己生成的无头消息二次进入循环
+    const skipCheck = await redisCmd('get', `skip:${messageId}`);
+    if (skipCheck.ok && skipCheck.result) {
+      return res.status(200).send('OK');
+    }
 
     const video = message.video;
     const photo = message.photo;
@@ -527,7 +524,6 @@ export default async function handler(req, res) {
 
     if (!video && !photo && !animation && !document) return res.status(200).send('OK');
 
-    const messageId = message.message_id;
     const chatTitle = message.chat.title || currentChatId;
     
     let uniqueId = null;
@@ -563,7 +559,7 @@ export default async function handler(req, res) {
     const settings = await getBotSettingsCached();
 
     // ---------------------------------------------------------
-    // 分支 3.1: Redis 查重拦截 (拦截 + 老数据兼容)
+    // 分支 3.1: Redis 查重拦截 (检测到已有记录)
     // ---------------------------------------------------------
     if (uniqueId && settings.dedupEnabled) {
       const redisKey = `file:${currentChatId}:${uniqueId}`;
@@ -575,89 +571,41 @@ export default async function handler(req, res) {
       }
 
       if (recordRes.result !== null) {
-        const valStr = String(recordRes.result);
-
-        // 新 JSON 格式处理
-        let originData = null;
-        try { originData = JSON.parse(valStr); } catch (e) { originData = null; }
-
-        if (originData && originData.origin_message_id) {
-          const targetChatId = originData.origin_chat_id || currentChatId;
-          const originMsgId = originData.origin_message_id;
-          
-          await safeDeleteMessage(currentChatId, messageId);
-          await sendDuplicateNotice(currentChatId, targetChatId, originMsgId);
-          return res.status(200).send('OK');
+        // 发现重复！如果开启了备份，私发给管理员
+        if (settings.backupEnabled && ADMIN_USER_ID) {
+          processDuplicateBackup(chatTitle, currentChatId, messageId, {
+            mediaType, fileName, fileSizeFormatted
+          }).catch(() => {});
         }
 
-        // 老数据 "1" 兼容处理
-        if (valStr === "1") {
-          if (settings.backupEnabled && ADMIN_USER_ID) {
-            processDuplicateBackup(chatTitle, currentChatId, messageId, {
-              mediaType, fileName, fileSizeFormatted
-            }).catch(() => {});
-          }
-          await safeDeleteMessage(currentChatId, messageId);
-          return res.status(200).send('OK');
-        }
+        // 静默删除频道内的重复消息
+        await safeDeleteMessage(currentChatId, messageId);
+        return res.status(200).send('OK');
       }
     }
 
     // ---------------------------------------------------------
-    // 分支 3.2: 正常新文件 (复制无头件 -> SET NX 抢锁 -> 备份 -> 删原件)
+    // 分支 3.2: 正常新文件处理 (复制无头消息 -> 写入 Redis -> 标 Skip -> 删原件)
     // ---------------------------------------------------------
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
+      // 1. 设置 skip 缓存（60秒），防止复制出的新消息引发二次 Webhook 误判
+      await redisCmd('set', `skip:${copyProcess.messageId}`, '1', 'EX', '60');
+
+      // 2. 写入数据库记忆
       if (uniqueId && settings.dedupEnabled) {
         const redisKey = `file:${currentChatId}:${uniqueId}`;
-        
         const originPayload = JSON.stringify({
           origin_chat_id: currentChatId,
           origin_message_id: copyProcess.messageId,
           backup_message_id: null
         });
 
-        // SET NX 防并发
-        const setRes = await redisCmd('set', redisKey, originPayload, 'NX');
-        
-        // 抢锁失败降级处理
-        if (!setRes.ok || setRes.result !== "OK") {
-          console.warn(`⚡ [高并发抢锁] 抢锁失败，降级为去重流程`);
-          
-          await safeDeleteMessage(currentChatId, copyProcess.messageId);
-          await safeDeleteMessage(currentChatId, messageId);
-
-          const winRecord = await redisCmd('get', redisKey);
-          if (winRecord.ok && winRecord.result) {
-            try {
-              const winData = JSON.parse(winRecord.result);
-              if (winData.origin_message_id) {
-                await sendDuplicateNotice(currentChatId, winData.origin_chat_id || currentChatId, winData.origin_message_id);
-              }
-            } catch (e) {}
-          }
-          return res.status(200).send('OK');
-        }
-
-        // 抢锁成功者（唯一赢家）触发备份
-        if (settings.backupEnabled && ADMIN_USER_ID) {
-          const backupMsgId = await processDuplicateBackup(chatTitle, currentChatId, messageId, {
-            mediaType, fileName, fileSizeFormatted
-          }).catch(() => null);
-
-          if (backupMsgId) {
-            const updatedPayload = JSON.stringify({
-              origin_chat_id: currentChatId,
-              origin_message_id: copyProcess.messageId,
-              backup_message_id: backupMsgId
-            });
-            await redisCmd('set', redisKey, updatedPayload);
-          }
-        }
+        await redisCmd('set', redisKey, originPayload);
       }
 
-      // 删除用户带头的原始消息
+      // 3. 删除用户/管理员发送的带头原始消息，频道仅保留无头消息
       await safeDeleteMessage(currentChatId, messageId);
     }
 
